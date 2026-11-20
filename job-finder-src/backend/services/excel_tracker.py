@@ -197,6 +197,17 @@ class ExcelTracker:
         if path is None and not os.getenv("JOB_FINDER_TRACKER_XLSX"):
             self._migrate_legacy_xlsx()
 
+    def _is_original_workbook(self) -> bool:
+        """Only the original scanned_jobs.xlsx may import the old CSV tracker; per-search workbooks start empty."""
+        try:
+            try:
+                from config.constants import get_tracker_xlsx_path
+            except ImportError:
+                from backend.config.constants import get_tracker_xlsx_path
+            return os.path.abspath(self.path) == os.path.abspath(get_tracker_xlsx_path())
+        except Exception:
+            return False
+
     def _migrate_legacy_xlsx(self) -> None:
         """job_applications_tracker.xlsx (earlier name) -> scanned_jobs.xlsx, once."""
         try:
@@ -352,7 +363,7 @@ class ExcelTracker:
                     cell.alignment = Alignment(wrap_text=False, vertical="top")
 
     def _import_legacy_csv(self, ws) -> None:
-        csv_path = _legacy_csv_path()
+        csv_path = _legacy_csv_path() if self._is_original_workbook() else None
         if not csv_path:
             return
         try:
@@ -389,7 +400,7 @@ class ExcelTracker:
     def rows(self) -> List[Dict[str, Any]]:
         """All rows as dicts keyed by column header (plus ``_row``). Empty list if no file yet."""
         with _lock:
-            if not os.path.exists(self.path) and not _legacy_csv_path():
+            if not os.path.exists(self.path) and not (_legacy_csv_path() and self._is_original_workbook()):
                 return []
             wb = self._open()
             return self._rows(wb[SHEET] if SHEET in wb.sheetnames else wb.active)
@@ -489,6 +500,30 @@ class ExcelTracker:
             if changed:
                 self._save(wb)
             return changed
+
+    def remove_rows(self, row_ids: Iterable[int]) -> int:
+        """
+        Delete rows by ID. The sheet is rewritten (not row-deleted) so hyperlinks stay attached to the right rows.
+        Returns how many rows were removed.
+        """
+        gone = {int(i) for i in row_ids}
+        with _lock:
+            if not os.path.exists(self.path):
+                return 0
+            wb = self._open()
+            ws = wb[SHEET] if SHEET in wb.sheetnames else wb.active
+            rows = self._rows(ws)
+            keep = [r for r in rows if _to_int(r.get("ID")) not in gone]
+            removed = len(rows) - len(keep)
+            if not removed:
+                return 0
+            hdr = self._headers(ws)
+            ws.delete_rows(2, max(ws.max_row, 2))
+            ws._hyperlinks = []
+            for n, r in enumerate(keep, start=2):
+                self._write_row(ws, n, {k: v for k, v in r.items() if k in hdr})
+            self._save(wb)
+            return removed
 
     def mark_expired(self, today: Optional[date] = None) -> int:
         """Set Status=Closed on unapplied open rows whose closing date has passed. Returns the count."""

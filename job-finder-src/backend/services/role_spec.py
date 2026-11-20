@@ -33,7 +33,7 @@ LEVELS: Dict[str, Dict[str, List[str]]] = {
     "graduate": {
         "queries": ["Graduate"],
         "terms": ["graduate", "graduates", "new grad", "grad scheme", "early careers", "early career",
-                  "entry level", "entry-level", "trainee"],
+                  "entry level", "entry-level", "trainee", "junior", "jr"],
     },
     "junior": {
         "queries": ["Junior"],
@@ -61,7 +61,15 @@ _FILLER = {"job", "jobs", "role", "roles", "position", "positions", "opportunity
 _GENERIC = {"engineer", "engineering", "developer", "software", "research", "researcher", "data", "analyst",
             "scientist", "technology", "tech", "computing", "computer", "science", "manager", "specialist",
             "consultant", "applied", "advanced", "modern", "digital", "systems", "system", "product", "project",
-            "and", "or", "the", "of", "for", "in", "with", "a", "an"}
+            "and", "or", "the", "of", "for", "in", "with", "a", "an",
+            # generic business / admin words that drift into an LLM-built field map and then match every job
+            "strategy", "operations", "operation", "control", "controls", "policy", "compliance", "ethics", "fairness", "robustness",
+            "planning", "support", "management", "marketing", "sales", "finance", "business", "commercial", "growth", "program",
+            "programme", "consulting", "associate", "assistant", "officer", "executive", "administrator", "coordinator", "advisor",
+            "adviser", "manager", "director", "lead", "operations associate", "strategy associate", "policy analyst",
+            "compliance officer", "regulatory affairs", "game theory", "decision theory", "cognitive science", "bioethics",
+            "societal impact", "futures research", "content moderation", "ethics researcher", "human oversight", "agent foundations",
+            "dual use", "existential risk", "biorisk", "robotic", "algorithm", "analytics", "evaluation", "assessment", "risk"}
 
 
 def normalize_level(level: Optional[str]) -> Optional[str]:
@@ -112,6 +120,9 @@ _FAMILIES = {
     **{w: r"engineer(?:s|ing)?" for w in ("engineer", "engineers", "engineering")},
     **{w: r"develop(?:er|ers|ment|ing)?" for w in ("developer", "developers", "development", "developing")},
     **{w: r"analy(?:st|sts|tics|tic|sis)" for w in ("analyst", "analysts", "analytics", "analytic", "analysis")},
+    **{w: r"test(?:ing|er|ers|s)?" for w in ("testing", "tester", "testers", "test")},
+    **{w: r"hack(?:ing|er|ers|s)?" for w in ("hacking", "hacker", "hackers")},
+    **{w: r"defen[cs]e" for w in ("defense", "defence")},
 }
 
 
@@ -367,6 +378,32 @@ def build_queries(topics: List[str], level: str, sub_searches: Optional[List[Lis
     for suf in suffixes[1:]:
         out += [f"{t} {suf}".strip() for t in topics]
     return list(dict.fromkeys(out))[:cap]
+
+
+def parse_inputs(topic: Optional[str] = None, level: Optional[str] = None, request: Optional[str] = None,
+                 role: Optional[str] = None, prefs: Optional[dict] = None) -> Tuple[List[str], Optional[str]]:
+    """
+    The topics and level a scan will use, with the same precedence as resolve_spec but WITHOUT any LLM call
+    (used to name the search's Excel). Explicit --role gives no topics. Returns (topics, level or None).
+    """
+    prefs = prefs or {}
+    topics: List[str] = []
+    lvl: Optional[str] = None
+    if request:
+        t, l = parse_request(request)
+        topics += t
+        lvl = l
+    if topic:
+        topics += [p.strip() for p in re.split(r"[,;]", topic) if p.strip()]
+    if level:
+        lvl = normalize_level(level)
+    if role:
+        return [], lvl
+    if not topics:
+        topics = [t for t in prefs.get("topics", []) if t]
+    if not lvl and prefs.get("level"):
+        lvl = normalize_level(prefs.get("level"))
+    return list(dict.fromkeys(topics)), lvl
 
 
 def resolve_spec(

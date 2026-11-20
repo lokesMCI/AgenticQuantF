@@ -85,6 +85,31 @@ Useful options: `--limit 20`, `--min-ats 70`, `--loose` (also read descriptions)
 
 > **Why "130 found" can become 15 saved:** "found" counts everything every source returned. Job boards like Jobserve and Indeed ignore "Intern" and return permanent roles, which the level filter removes; jobs already in your tracker are skipped; off-topic titles are dropped. Real internships come mostly from LinkedIn. **Internships stay open for weeks, so use a month window (`--timeframe 1m`, or `timeframe` in your profile) for the first scans** (a one-week window found 1 new applied-AI internship, a month found about 20).
 
+#### One Excel per search
+
+Every search has **its own folder, its own Excel files and its own application packs**, so a cyber-security search never mixes with your AI search:
+
+```bash
+./jf scan cyber security graduate roles          # new topic + level  -> NEW Excel   (searches/cyber-security-<id>_graduate/)
+./jf scan cyber security graduate roles          # same search again  -> UPDATES that same Excel with only the new postings
+./jf scan --search cyber-security-graduate       # repeat a saved search by name (its topics, level and location are remembered)
+./jf scan --into cyber-security-graduate ai safety graduate   # add a different query's results to an existing Excel
+./jf scan --into ~/Desktop/my_list.xlsx ...      # ...or to any .xlsx file you choose
+./jf scan applied AI internships --name ai-intern             # choose the Excel's name yourself
+```
+
+```bash
+./jf searches                  # list every search: topics, level, jobs, approved, applied, last scan (* = current)
+./jf searches use cyber        # switch the search that approve / prepare / review / apply / open work on (a unique prefix is enough)
+./jf open --search cyber       # or name the search for a single command (works on approve, prepare, review, apply, tracker too)
+./jf searches move --from main --to cyber-security-graduate --ids 46-52   # move not-yet-approved jobs between Excel files
+```
+
+* The Excel **is** the source of truth: edit statuses, tick **Approve**, delete or add notes, and every command respects what is in the file.
+* The same topic + level always maps to the same Excel (case-insensitive), so repeating a search only adds new postings. After a scan, that search becomes the **current** one.
+* **A job applied to in one search is never applied to again from another**, and a scan skips jobs you already applied to in any search.
+* Packs live in `applications/<search>/`, so IDs never collide between searches. The original single workbook pair is the search called `main`.
+
 #### Where the jobs come from
 
 | Source | How | Needs |
@@ -182,10 +207,14 @@ AgenticQuantF/                      (your working folder; everything below marke
 ├── candidate_profile.json                private: YOUR profile = the single source of truth for CV / letters / scoring
 │
 ├── applications_tracker/
-│   ├── scanned_jobs.xlsx                 private: EVERYTHING `scan` found (you review here, tick Approve)
-│   └── approved_jobs.xlsx                private: the queue `apply` reads (only jobs you approved)
+│   ├── scanned_jobs.xlsx                 private: the original search ("main"): EVERYTHING it found (you review here, tick Approve)
+│   ├── approved_jobs.xlsx                private: its queue `apply` reads (only jobs you approved)
+│   └── searches/<search-name>/           private: ONE FOLDER PER SEARCH, each with its own
+│       ├── search.json                   what was searched (topics, level, location) + scan history
+│       ├── scanned_jobs.xlsx             everything that search found
+│       └── approved_jobs.xlsx            that search's apply queue
 │
-├── applications/                         private: ONE FOLDER PER APPROVED JOB
+├── applications/                         private: ONE FOLDER PER APPROVED JOB (per-search packs are under applications/<search-name>/)
 │   └── 0007_acme-ltd_applied-ai-intern/
 │       ├── REVIEW.md                     what to check, in order, plus any warnings
 │       ├── job.md                        link, location, closing date, scores, why it fits
@@ -250,7 +279,8 @@ The model never writes a free-form CV. It returns a **plan over your existing ma
 ./jf doctor                                   # health check
 ./jf boards refresh                           # 0. (weekly) index ~8,500 company boards
 ./jf topic cyber security                     # what a topic covers (--refresh to rebuild)
-./jf scan cyber security internships          # 1. find + score jobs  -> scanned_jobs.xlsx
+./jf scan cyber security internships          # 1. find + score jobs  -> this search's own Excel
+./jf searches                                 #    list searches (one Excel each); `searches use NAME` to switch
 ./jf open                                     # 2. review in Excel, tick Approve = Yes
 ./jf approve                                  # 3. queue them + build packs (CV, cover letter, notes)
 ./jf review --open 3  &&  ./jf review --ok 3  # 4. read the pack, then sign off

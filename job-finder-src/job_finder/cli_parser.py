@@ -69,6 +69,9 @@ def build_parser(version: str) -> argparse.ArgumentParser:
     scanner_parser.add_argument("--skip-portals", type=str, default=None, help="Comma-separated list of job portals/boards to skip (e.g. 'targetjobs,reed,indeed')")
     scanner_parser.add_argument("--harvest", action="store_true", help="Harvest and validate fresh ATS company slugs (Ashby, Greenhouse, Lever) before scanning")
     # Retired: scan no longer applies. Kept (hidden) so old commands fail with a pointer to `apply`.
+    scanner_parser.add_argument("--search", type=str, default=None, metavar="NAME", help="Repeat a saved search and update ITS Excel (see `job-finder searches`)")
+    scanner_parser.add_argument("--into", type=str, default=None, metavar="NAME|FILE.xlsx", help="Add the results to this existing search / Excel file instead of the one this topic would use")
+    scanner_parser.add_argument("--name", type=str, default=None, help="Give this search's Excel a name of your choice (default: derived from topic + level)")
     scanner_parser.add_argument("--no-boards", action="store_true", help="Skip the company-board index (Greenhouse / Lever / Ashby boards)")
     scanner_parser.add_argument("--dry-run", action="store_true", help="Search and filter only: print the whole funnel and every dropped title, write nothing, score nothing")
     for _flag in ("--auto-apply", "--auto-submit"):
@@ -135,6 +138,14 @@ def build_parser(version: str) -> argparse.ArgumentParser:
     boards_parser.add_argument("--force", action="store_true", help="Re-visit every board, ignoring how recently it was checked")
     boards_parser.add_argument("--location", type=str, default=None, help="City to index (default: first target_locations entry)")
     boards_parser.add_argument("--concurrency", type=int, default=24, help="Parallel requests (default 24)")
+
+    # 2b5. searches: one Excel per search
+    searches_parser = subparsers.add_parser("searches", help="List searches (one Excel each), switch the current one, or move jobs between them")
+    searches_parser.add_argument("action", nargs="?", choices=["list", "use", "move", "path"], default="list")
+    searches_parser.add_argument("name", nargs="?", default=None, help="Search name for `use` / `path` (a unique prefix is enough)")
+    searches_parser.add_argument("--from", dest="source", type=str, default=None, help="move: source search")
+    searches_parser.add_argument("--to", type=str, default=None, help="move: target search (created if it does not exist)")
+    searches_parser.add_argument("--ids", type=str, default=None, help="move: job IDs, e.g. 3,5,8-10")
 
     # 2c. Open subcommand
     open_parser = subparsers.add_parser("open", help="Open the scanned or approved Excel file")
@@ -216,6 +227,9 @@ def build_parser(version: str) -> argparse.ArgumentParser:
     tracker_parser.add_argument("--status", type=str, default="all", help="Filter by status text, case-insensitive (all, saved, applied, review, blocked, ...)")
     tracker_parser.add_argument("--limit", type=int, default=20, help="Max entries to list (default: 20, 0 = all)")
     tracker_parser.add_argument("--json", action="store_true", help="Print results as JSON")
+
+    for _p in (approve_parser, prep_parser, review_parser, apply_parser, open_parser, tracker_parser):
+        _p.add_argument("--search", type=str, default=None, metavar="NAME", help="Work on this search's Excel instead of the current one (see `job-finder searches`)")
 
     # 10. Company subcommand (Agent-Reach Culture Brief)
     company_parser = subparsers.add_parser(

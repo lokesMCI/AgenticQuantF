@@ -118,6 +118,12 @@ def run(args: argparse.Namespace):
     # ── choose what to apply to ──────────────────────────────────────────────
     jobs: List[Dict[str, Any]] = []
     handled = _handled_in_scanned(scanned, _clean_status, normalize_job_url)
+    try:
+        from backend.services import searches as _searches
+        for u, name in _searches.handled_elsewhere(exclude_scanned=scanned.path).items():
+            handled.setdefault(u, {"ID": "-", "Status": "Applied", "Applied": "Yes", "_note": f"Already applied in search '{name}'"})
+    except Exception:
+        pass
     if args.target:
         by_url = {}
         for wb in (scanned, tracker):                      # scanned first, so approved rows win
@@ -146,7 +152,7 @@ def run(args: argparse.Namespace):
         for r in vetoed:                                   # the scanned file says it's done: believe it, and sync the queue
             h = handled[normalize_job_url(r["Job URL"])]
             print(f"[Queue] Skipping #{r.get('ID')} {r.get('Company')}: marked {h.get('Status')} in the scanned file.")
-            tracker.update(url=r["Job URL"], status=h.get("Status") or "Applied", append_note="Marked in the scanned file")
+            tracker.update(url=r["Job URL"], status=h.get("Status") or "Applied", append_note=h.get("_note") or "Marked in the scanned file")
         rows = [r for r in rows if r not in vetoed]
         # Review gate: a job is only applied to once you have read its CV / cover letter and signed it off.
         no_pack = bool(getattr(args, "no_pack", False))

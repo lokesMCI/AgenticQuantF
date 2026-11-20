@@ -115,7 +115,23 @@ def _main():
             args.submit = False
         ui.info("Dry run: applications will be filled but never submitted.")
 
-    if args.subcommand == "scan":
+    if args.subcommand in ("approve", "prepare", "review", "apply", "open", "tracker"):
+        # These all work on ONE search's Excel: `--search NAME`, else the search you scanned last.
+        try:
+            from backend.services import searches as _searches
+            _s = _searches.resolve_current(getattr(args, "search", None))
+            _searches.activate(_s)
+            if args.subcommand != "tracker" or not getattr(args, "json", False):
+                ui.info(f"Search: {_s.name}")
+        except KeyError as _e:
+            ui.error(str(_e))
+            sys.exit(2)
+
+    if args.subcommand == "searches":
+        from job_finder.commands.searches import run as _run
+        _run(args)
+
+    elif args.subcommand == "scan":
         from job_finder.commands.scan import run as _run
         _run(args)
 

@@ -3,6 +3,7 @@
 import argparse
 import logging
 import sys
+from datetime import datetime
 
 from job_finder import ui
 
@@ -45,9 +46,40 @@ def run(args: argparse.Namespace):
     except Exception as he:
         logger.debug(f"Harvester init note: {he}")
 
+    # ── which Excel does this search belong to? (one per search; repeating a search updates the same one) ──
+    from backend.job_finder_mcp.tools.profile_tools import load_profile_data
+    from backend.services import role_spec, searches
+    prefs = (load_profile_data() or {}).get("search_preferences", {})
+    try:
+        base = searches.get(args.search) if args.search else None
+        meta = (base.meta if base else {}) or {}
+        # `--search NAME` repeats a saved search; anything typed now overrides its saved criteria
+        topic = args.topic or (None if (request or args.role) else (", ".join(meta.get("topics", [])) or None))
+        level = args.level or meta.get("level")
+        role = args.role or (meta.get("role") if not (request or args.topic) else None)
+        location = args.location or meta.get("location")
+        topics, lvl = role_spec.parse_inputs(topic, level, request or None, role, prefs)
+        if args.into:
+            target, created = (searches.get(args.into), False) if _exists(searches, args.into) else searches.get_or_create(args.into)
+        elif args.name:
+            target, created = searches.get_or_create(args.name)
+        elif base:
+            target, created = base, False
+        else:
+            name = searches.auto_name(topics, lvl, role)
+            target, created = (searches._paths(name), not searches._paths(name).exists) if args.dry_run else \
+                searches.get_or_create(name, topics=topics, level=lvl, role=role)
+    except (KeyError, ValueError) as e:
+        ui.error(str(e))
+        sys.exit(2)
+    n_existing = searches.counts(target)["jobs"] if target.exists else 0
+    ui.info(f"Search '{target.name}': " + ("new Excel will be created" if not target.exists else f"updating its Excel ({n_existing} jobs so far)")
+            + f"\n  {target.scanned}")
+    searches.activate(target)
+
     asyncio.run(run_scan(
-        role=args.role,
-        location_override=args.location,
+        role=role,
+        location_override=location,
         timeframe_override=args.timeframe,
         min_ats=args.min_ats,
         limit=args.limit if args.limit > 0 else None,
@@ -56,8 +88,8 @@ def run(args: argparse.Namespace):
         top_applicant_only=True if args.top_applicant else None,
         headless=True if args.headless else None,
         enrich=not args.no_enrich,
-        topic=args.topic,
-        level=args.level,
+        topic=topic,
+        level=level,
         request=request or None,
         loose=args.loose,
         exact=args.exact,
@@ -65,3 +97,18 @@ def run(args: argparse.Namespace):
         dry_run=args.dry_run,
         use_boards=not args.no_boards,
     ))
+    if not args.dry_run:
+        meta_now = searches._load_meta(target)
+        searches.save_meta(target, topics=topics or meta_now.get("topics", []), level=lvl, role=role, location=location or (prefs.get("target_locations") or ["London, UK"])[0],
+                           request=request or meta_now.get("request"), last_scan=datetime.now().isoformat(timespec="seconds"),
+                           scans=int(meta_now.get("scans", 0)) + 1)
+        searches.set_current(target.name)
+        print(f"\nCurrent search is now '{target.name}': approve / prepare / review / apply / open work on it.  (./jf searches lists them all)")
+
+
+def _exists(searches, ref):
+    try:
+        searches.get(ref)
+        return True
+    except KeyError:
+        return False

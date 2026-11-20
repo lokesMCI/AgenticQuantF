@@ -114,7 +114,7 @@ def test_legacy_status_mapping_and_csv_import(tmp_path, monkeypatch):
         "Matched Skills,Missing Skills,Salary,Seniority,Recruiter,Recruiter LinkedIn,PDF Path,LaTeX Path,Status,Job URL\n"
         "Acme,Engineer,London,Jobserve,2026-11-20; 05:19,71%,60%,0%,75%,,,,Mid,,,/x/a.pdf,,Tailored & Ready,https://x.com/j/1\n")
     monkeypatch.setenv("JOB_FINDER_ROOT", str(tmp_path))
-    t = ExcelTracker(str(tmp_path / "applications_tracker" / "job_applications_tracker.xlsx"))
+    t = ExcelTracker(str(tmp_path / "applications_tracker" / "scanned_jobs.xlsx"))     # only the ORIGINAL workbook imports the old CSV
     added, _ = t.add_jobs([_job(1)])
     rows = t.rows()
     assert rows[0]["Company"] == "Acme" and rows[0]["Status"] == "New" and rows[0]["ATS %"] == 71
@@ -181,3 +181,28 @@ def test_upgrading_an_older_workbook_adds_dropdowns_for_the_new_columns(tmp_path
     status_letter = get_column_letter(headers.index("Status") + 1)
     assert any(s.startswith(f"{status_letter}2") for s in sqrefs)           # Status dropdown re-pointed at its real column
     assert t.rows()[0]["Approve"] == "Yes"
+
+
+def test_a_workbook_for_another_search_does_not_import_the_old_csv(tmp_path, monkeypatch):
+    (tmp_path / "applications_tracker").mkdir()
+    (tmp_path / "applications_tracker" / "job_applications_tracker.csv").write_text(
+        "Company,Job Title,Location,Platform,Posted Time,Overall ATS,Skills Match,Experience Match,Role Fit,Matched Skills,Missing Skills,"
+        "Salary,Seniority,Recruiter,Recruiter LinkedIn,PDF Path,LaTeX Path,Status,Job URL\nOld,Role,L,P,t,1%,1%,1%,1%,,,,,,,,,New,https://x.com/1\n")
+    monkeypatch.setenv("JOB_FINDER_ROOT", str(tmp_path))
+    other = ExcelTracker(str(tmp_path / "applications_tracker" / "searches" / "cyber" / "scanned_jobs.xlsx"))
+    assert other.rows() == []
+    other.add_jobs([_job(1)])
+    assert [r["Company"] for r in other.rows()] == ["Co1"]
+
+
+def test_remove_rows_keeps_hyperlinks_on_the_right_rows(tracker):
+    from openpyxl import load_workbook
+    tracker.add_jobs([_job(1), _job(2), _job(3)])
+    assert tracker.remove_rows([2, 99]) == 1
+    rows = tracker.rows()
+    assert [r["ID"] for r in rows] == [1, 3] and [r["Company"] for r in rows] == ["Co1", "Co3"]
+    ws = load_workbook(tracker.path)["Jobs"]
+    h = [c.value for c in ws[1]]
+    col = h.index("Job URL") + 1
+    assert [ws.cell(row=r, column=col).hyperlink.target for r in (2, 3)] == [rows[0]["Job URL"], rows[1]["Job URL"]]
+    assert ws.max_row == 3 or all(ws.cell(row=r, column=1).value is None for r in range(4, ws.max_row + 1))

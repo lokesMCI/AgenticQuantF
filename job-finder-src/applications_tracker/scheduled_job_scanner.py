@@ -1011,6 +1011,11 @@ async def run_scan(
     print(f"\n[Scan] {len(jobs)} postings discovered across sources.")
 
     existing = get_existing_tracked_urls()
+    try:
+        from services import searches as _searches
+        elsewhere = _searches.handled_elsewhere(exclude_scanned=tracker.path)   # url -> search where you already applied
+    except Exception:
+        elsewhere = {}
     seen = set()
     counts = {"duplicate": 0, "irrelevant": 0, "non_sponsor": 0, "no_url": 0, "not_a_job": 0, "off_topic": 0}
     fresh = []
@@ -1035,6 +1040,11 @@ async def run_scan(
             drops.append(("community thread", job.get("title") or "", job.get("company") or "", src_of(job), "Reddit/HN lead, not a posting"))
             continue
         norm = normalize_job_url(url)
+        if norm in elsewhere and norm not in existing:
+            counts["duplicate"] += 1
+            drops.append(("applied elsewhere", job.get("title") or "", job.get("company") or "", src_of(job),
+                          f"you already applied to this in search '{elsewhere[norm]}'"))
+            continue
         if norm in existing or norm in seen:
             counts["duplicate"] += 1
             drops.append(("already tracked", job.get("title") or "", job.get("company") or "", src_of(job),

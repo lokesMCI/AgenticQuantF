@@ -255,3 +255,32 @@ def test_science_scientist_research_researcher_engineer_engineering_are_the_same
         assert spec.matches(title)[0], title
     assert not spec.matches("Computer Science Teacher Intern")[0]                  # 'science' alone is not 'data science'
     assert not spec.matches("Marketing Intern")[0]
+
+
+# ─── regressions from a live graduate cyber-security scan ─────────────────────────────────────
+def test_generic_business_words_in_the_model_family_cannot_match_everything():
+    """The model's 'ai safety' map contained 'strategy' and 'operations', which matched every 'Operations Associate'."""
+    spec = rs.resolve_spec(topic="ai safety", level="graduate", llm=lambda t: {
+        "include": ["ai safety", "alignment researcher", "strategy", "operations", "control", "policy analyst", "game theory", "fairness"],
+        "exclude": [], "search": []})
+    for junk in ("Operations Associate", "AI Operations Associate", "Graduate Strategy Associate", "Graduate Operations Analyst",
+                 "Graduate Policy Analyst", "Graduate Control Engineer"):
+        assert not spec.matches(junk)[0], junk
+    assert spec.matches("Graduate AI Safety Researcher")[0] and spec.matches("Junior Alignment Researcher")[0]
+    assert "operations" not in spec.topic_terms and "strategy" not in spec.topic_terms
+
+
+def test_a_stale_cached_family_with_generic_words_is_cleaned_when_read(tmp_path):
+    import json as _j
+    path = rs._cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _j.dump({"ai safety": {"include": ["ai safety", "operations", "strategy"], "exclude": [], "search": []}}, open(path, "w"))
+    fam = rs.get_family("ai safety", llm=lambda t: (_ for _ in ()).throw(AssertionError("must use the cache")))
+    assert fam.include == ["ai safety"]
+
+
+def test_tester_testing_hacker_hacking_defence_defense_are_one_family():
+    spec = rs.resolve_spec(topic="penetration testing, ethical hacking, cyber defence", level="graduate", exact=False,
+                           llm=lambda t: {"include": [t.lower()], "exclude": [], "search": []})
+    for title in ("Junior Penetration Tester", "Graduate Ethical Hacker", "Graduate Cyber Defense Analyst", "Graduate Penetration Testing Consultant"):
+        assert spec.matches(title)[0], title
