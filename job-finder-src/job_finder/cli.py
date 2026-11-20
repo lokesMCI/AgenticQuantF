@@ -106,7 +106,7 @@ def _main():
     if args.subcommand != "mcp":
         check_for_updates()
 
-    if args.subcommand in ("scan", "apply") and getattr(args, "dry_run", False):
+    if args.subcommand == "apply" and getattr(args, "dry_run", False):
         # Dry run: fill and review only. Overrides .env and any auto-submit flag so nothing is submitted.
         os.environ["JOB_FINDER_DISABLE_GUARDRAILS"] = "0"
         os.environ["BROWSER_USE_DISABLE_GUARDRAILS"] = "0"

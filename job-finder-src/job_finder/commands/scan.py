@@ -62,4 +62,5 @@ def run(args: argparse.Namespace):
         loose=args.loose,
         exact=args.exact,
         ai_score=not args.no_ai_score,
+        dry_run=args.dry_run,
     ))

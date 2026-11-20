@@ -725,7 +725,12 @@ async def discover_jobs(
             if env_skip:
                 excluded_list.extend([p.strip().lower() for p in env_skip.split(",") if p.strip()])
 
-        excluded_list = list(dict.fromkeys(excluded_list)) if excluded_list else None
+        # An EMPTY list means "skip nothing" (e.g. --skip-portals none); None would fall back to the default,
+        # which silently excludes TargetJobs (a UK graduate/internship board).
+        skip_nothing = bool(skip_portals and skip_portals.strip().lower() in ("none", "false", "0")) or \
+            (not skip_portals and isinstance(prefs.get("skip_portals", prefs.get("exclude_portals")), list)
+             and not prefs.get("skip_portals", prefs.get("exclude_portals")))
+        excluded_list = list(dict.fromkeys(excluded_list)) if excluded_list else ([] if skip_nothing else None)
         if excluded_list:
             print(f"[Scanner] Skipping excluded portal(s): {', '.join(excluded_list)}")
         search_res = await handle_search_jobs({
@@ -832,6 +837,43 @@ async def fetch_live_jd_and_score(job: dict, candidate: dict, timeout: float = 3
     return True
 
 
+def _print_dry_run(jobs, kept, drops, spec, queries, location, timeframe, src_of) -> None:
+    """Search-only report: where the postings came from, what each stage removed, and every dropped title with its reason."""
+    from collections import Counter
+    line = "=" * 78
+    print(f"\n{line}\nSEARCH-ONLY DRY RUN  (nothing was written to Excel, nothing was scored)\n{line}")
+    print(f"Searched : {', '.join(queries)}")
+    print(f"Where    : {location}   Window: {timeframe}")
+    if spec:
+        print(f"Filter   : {spec.describe()}")
+    by_src = Counter(src_of(j) for j in jobs)
+    print(f"\nDISCOVERED {len(jobs)} postings, by source:")
+    for src, n in by_src.most_common():
+        kept_n = sum(1 for k in kept if src_of(k) == src)
+        print(f"   {src:<28} {n:>4} found  ->  {kept_n:>3} kept")
+    stages = Counter(d[0] for d in drops)
+    print(f"\nWHERE THE {len(jobs) - len(kept)} REMOVED POSTINGS WENT:")
+    for stage, n in stages.most_common():
+        print(f"   {stage:<24} {n:>4}")
+    reasons = Counter(d[4].split(" (")[0] for d in drops if d[0] == "topic/level filter")
+    if reasons:
+        print("   of the topic/level filter:")
+        for r, n in reasons.most_common():
+            print(f"      - {r:<44} {n:>4}")
+    print(f"\nWOULD BE SAVED: {len(kept)}")
+    for j in kept:
+        print(f"   + {str(j.get('title'))[:60]:<60} {str(j.get('company'))[:24]:<24} [{src_of(j)}]")
+    print("\nREMOVED BY THE TOPIC/LEVEL FILTER (check these: anything here that you wanted means the filter is too strict):")
+    for stage, title, company, src, why in sorted((d for d in drops if d[0] == "topic/level filter"), key=lambda d: d[4]):
+        print(f"   x {title[:58]:<58} {company[:20]:<20} [{src[:10]}] {why}")
+    others = [d for d in drops if d[0] != "topic/level filter"]
+    if others:
+        print("\nREMOVED AT OTHER STAGES:")
+        for stage, title, company, src, why in others:
+            print(f"   x {title[:58]:<58} {company[:20]:<20} [{src[:10]}] {stage}: {why}")
+    print(f"{line}\nTo save these for real, run the same command without --dry-run.\n")
+
+
 async def run_scan(
     role: Optional[str] = None,
     location_override: Optional[str] = None,
@@ -850,6 +892,7 @@ async def run_scan(
     loose: bool = False,
     exact: bool = False,
     ai_score: bool = True,
+    dry_run: bool = False,
 ) -> dict:
     """
     Discover jobs and save them to the Excel tracker. Nothing is tailored or submitted.
@@ -861,6 +904,9 @@ async def run_scan(
     `topic` / `level`, explicit `role` queries, or the profile's `topics` / `level` / `target_roles`
     (see role_spec.resolve_spec). When a topic or level is in play, postings whose title doesn't fit
     are dropped (`loose` also reads the description; `exact` skips LLM synonym expansion).
+
+    `dry_run` is search-only: it searches and filters, prints the whole funnel (every dropped title with its reason),
+    and writes nothing (no Excel, no scoring, no LLM calls beyond the topic map).
 
     Scoring: with `ai_score` (default) each posting's full description is analysed against your profile
     by fit_scorer (evidence-based, cached). Where that is unavailable the old keyword scorer's number is
@@ -892,7 +938,7 @@ async def run_scan(
         print(f"Keeping titles that fit  [{spec.describe()}]" + (f"  matching: {', '.join(shown)}{' ...' if len(spec.topic_terms) > 14 else ''}" if shown else ""))
     print(f"Location: {location} | Timeframe: {timeframe} | Tracker: {tracker.path}\n")
 
-    closed = tracker.mark_expired()
+    closed = 0 if dry_run else tracker.mark_expired()
     if closed:
         print(f"[Tracker] Marked {closed} listing(s) Closed (closing date passed).")
 
@@ -907,6 +953,8 @@ async def run_scan(
     counts = {"duplicate": 0, "irrelevant": 0, "non_sponsor": 0, "no_url": 0, "not_a_job": 0, "off_topic": 0}
     fresh = []
     dropped = []  # (title, company, reason) for jobs the topic/level filter rejected, shown so you can sanity-check it
+    drops = []    # every job removed at any stage: (stage, title, company, source, reason)
+    src_of = lambda j: str(j.get("source") or j.get("platform") or "?")  # noqa: E731
     check_uk_sponsor = None
     try:
         from services.uk_sponsor_service import check_uk_sponsor  # type: ignore
@@ -916,24 +964,30 @@ async def run_scan(
         url = job.get("url") or job.get("apply_url", "")
         if not url:
             counts["no_url"] += 1
+            drops.append(("no link", job.get("title") or "", job.get("company") or "", src_of(job), "posting has no URL"))
             continue
         # Community threads (Reddit / HN) are leads, not postings: no company, nothing `apply` can fill in.
         if any(tag in str(job.get("platform") or job.get("source") or "").lower() for tag in ("reddit", "agent-reach", "hacker news")):
             counts["not_a_job"] += 1
+            drops.append(("community thread", job.get("title") or "", job.get("company") or "", src_of(job), "Reddit/HN lead, not a posting"))
             continue
         norm = normalize_job_url(url)
         if norm in existing or norm in seen:
             counts["duplicate"] += 1
+            drops.append(("already tracked", job.get("title") or "", job.get("company") or "", src_of(job),
+                          "already in your tracker" if norm in existing else "same job seen twice in this scan"))
             continue
         seen.add(norm)
         if any(bad in (job.get("title") or "").lower() for bad in IRRELEVANT_TITLE_KEYWORDS):
             counts["irrelevant"] += 1
+            drops.append(("irrelevant title", job.get("title") or "", job.get("company") or "", src_of(job), "non-technical title"))
             continue
         if spec:
             fits, _why = spec.matches(job.get("title") or "", job.get("description") or "")
             if not fits:
                 counts["off_topic"] += 1
                 dropped.append((job.get("title") or "", job.get("company") or "", _why))
+                drops.append(("topic/level filter", job.get("title") or "", job.get("company") or "", src_of(job), _why))
                 continue
         sponsor = ""
         if check_uk_sponsor:
@@ -943,9 +997,14 @@ async def run_scan(
                 sponsor = ""
         if sponsor_only and sponsor != "Yes":
             counts["non_sponsor"] += 1
+            drops.append(("not a UK sponsor", job.get("title") or "", job.get("company") or "", src_of(job), "company not on the sponsor register"))
             continue
         job["_uk_sponsor"] = sponsor
         fresh.append(job)
+
+    if dry_run:
+        _print_dry_run(jobs, fresh, drops, spec, target_roles, location, timeframe, src_of)
+        return {"added": 0, "duplicates": counts["duplicate"], "discovered": len(jobs), "would_save": len(fresh), "path": None}
 
     # Enrich concurrently: real JD where the listing was a stub, AI fit analysis, then closing date.
     live_scored = 0

@@ -78,7 +78,11 @@ What happens:
 4. **Score** each survivor against your profile (section 5) and look for a **closing date** (job text, page metadata, or a quoted deadline).
 5. **Save** everything new to `applications_tracker/scanned_jobs.xlsx`. Nothing is applied to.
 
-Useful options: `--limit 20`, `--min-ats 70`, `--loose` (also read descriptions), `--exact` (only your own words), `--no-ai-score`, `--no-enrich`, `--sponsor-only`, `--timeframe 24h|1w|1m`. See `./jf scan --help`.
+Useful options: `--limit 20`, `--min-ats 70`, `--loose` (also read descriptions), `--exact` (only your own words), `--no-ai-score`, `--no-enrich`, `--sponsor-only`, `--timeframe 24h|1w|1m`, `--skip-portals none`. See `./jf scan --help`.
+
+**`./jf scan ... --dry-run`** is a search-only test: it writes nothing and scores nothing, and prints the whole funnel (postings found per source, how many each stage removed, and *every* removed title with its reason). Use it whenever the number of saved jobs surprises you.
+
+> **Why "130 found" can become 15 saved:** "found" counts everything every source returned. Job boards like Jobserve and Indeed ignore "Intern" and return permanent roles, which the level filter removes; jobs already in your tracker are skipped; off-topic titles are dropped. Real internships come mostly from LinkedIn. **Internships stay open for weeks, so use a month window (`--timeframe 1m`, or `timeframe` in your profile) for the first scans** (a one-week window found 1 new applied-AI internship, a month found about 20).
 
 ### Step 2: Review in Excel and approve
 

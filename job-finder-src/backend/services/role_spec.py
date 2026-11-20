@@ -105,8 +105,20 @@ def parse_request(text: str) -> Tuple[List[str], Optional[str]]:
 
 
 # ─── term matching ────────────────────────────────────────────────────────────
+# Word families that job titles use interchangeably ("Applied Science Intern" is an "applied scientist" role).
+_FAMILIES = {
+    **{w: r"scien(?:ce|ces|tist|tists|tific)" for w in ("science", "sciences", "scientist", "scientists", "scientific")},
+    **{w: r"research(?:er|ers)?" for w in ("research", "researcher", "researchers")},
+    **{w: r"engineer(?:s|ing)?" for w in ("engineer", "engineers", "engineering")},
+    **{w: r"develop(?:er|ers|ment|ing)?" for w in ("developer", "developers", "development", "developing")},
+    **{w: r"analy(?:st|sts|tics|tic|sis)" for w in ("analyst", "analysts", "analytics", "analytic", "analysis")},
+}
+
+
 def _word_pattern(word: str) -> str:
-    """One word, tolerant of a plural in either direction ('forensic' <-> 'forensics', 'intern' <-> 'interns')."""
+    """One word, tolerant of plural/singular and of the usual noun/profession forms (science~scientist, research~researcher)."""
+    if word in _FAMILIES:
+        return _FAMILIES[word]
     w = re.escape(word)
     if len(word) >= 5 and word.endswith("s") and not word.endswith("ss"):
         return re.escape(word[:-1]) + "s?"

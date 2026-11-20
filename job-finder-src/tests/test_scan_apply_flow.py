@@ -344,3 +344,43 @@ def test_scan_finds_the_whole_field_and_drops_look_alikes(env, monkeypatch, tmp_
     assert kept == ["AI Security Research Intern", "Cyber Security Intern", "LLM Security Intern",
                     "Software Security Intern", "System Security Intern"]
     assert "application security Intern" in seen["target_roles"]          # sub-fields are searched, not only filtered
+
+
+# ─── search-only dry run + skip-portals ───────────────────────────────────────
+def test_dry_run_prints_the_whole_funnel_and_writes_nothing(env, monkeypatch, capsys):
+    async def fake_discover(**kwargs):
+        mk = lambda t, u, src: {"title": t, "company": "C" + u, "location": "London", "url": f"https://c.io/{u}",   # noqa: E731
+                                "platform": src, "ats_score": 70, "description": "d" * 150}
+        return [mk("Applied AI Intern", "1", "LinkedIn"), mk("Senior AI Engineer", "2", "Jobserve"),
+                mk("AI Engineer", "3", "Jobserve"), mk("Marketing Intern", "4", "LinkedIn"),
+                mk("Applied AI Intern", "1", "LinkedIn")], 0
+    monkeypatch.setattr(sc, "discover_jobs", fake_discover)
+
+    async def boom(*a, **k):
+        raise AssertionError("a dry run must not fetch descriptions or call the scorer")
+    monkeypatch.setattr(sc.fit_scorer, "score_job", boom)
+    monkeypatch.setattr(sc, "fetch_live_jd_and_score", boom)
+    out = asyncio.run(sc.run_scan(request="applied AI internships", dry_run=True))
+    text = capsys.readouterr().out
+    assert not os.path.exists(env.path)                                   # nothing written
+    assert out["would_save"] == 1 and out["added"] == 0
+    assert "SEARCH-ONLY DRY RUN" in text and "DISCOVERED 5 postings" in text
+    assert "Jobserve" in text and "LinkedIn" in text                      # per-source counts
+    assert "senior title" in text and "title has no intern keyword" in text and "off topic" in text
+    assert "x Senior AI Engineer" in text and "x Marketing Intern" in text   # every dropped title is listed
+    assert "same job seen twice" in text                                   # in-scan duplicate shown as a drop
+
+
+def test_skip_portals_none_really_skips_nothing(monkeypatch):
+    seen = []
+
+    async def fake_search(args):
+        seen.append(args.get("exclude_portals"))
+        return {"jobs": [], "est_jobs": []}
+    monkeypatch.setattr(sc, "handle_search_jobs", fake_search)
+    run = lambda **kw: asyncio.run(sc.discover_jobs(target_roles=["x"], location="L", timeframe="1w", **kw))  # noqa: E731
+    run(prefs={}, skip_portals="none")
+    run(prefs={"skip_portals": []})
+    run(prefs={})
+    run(prefs={"skip_portals": ["indeed"]})
+    assert seen == [[], [], ["targetjobs"], ["indeed"]]                    # explicit "none" -> []; default still skips TargetJobs

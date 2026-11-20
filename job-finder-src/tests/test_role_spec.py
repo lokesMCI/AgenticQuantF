@@ -244,3 +244,14 @@ def test_singular_and_plural_forms_match_either_way():
     spec = rs.resolve_spec(topic="ml researcher", level="intern", exact=True)
     assert spec.matches("ML Researchers Intern")[0] and spec.matches("ML Researcher Internship")[0]
     assert not rs.resolve_spec(topic="ai", level="intern", exact=True).matches("Aid Worker Intern")[0]   # no loose substring matching
+
+
+def test_science_scientist_research_researcher_engineer_engineering_are_the_same_family():
+    """Regression from a live dry run: 'Applied Science Intern' and 'Data Science PhD Intern' were dropped as off topic."""
+    spec = rs.resolve_spec(topic="applied AI engineer", level="intern", exact=False,
+                           llm=lambda t: {"include": ["applied scientist", "data scientist", "ml researcher", "ai engineer"], "exclude": [], "search": []})
+    for title in ("Applied Science Intern - PhD - 2027 - London", "Data Science PhD Intern, 2027", "ML Research Intern",
+                  "AI Engineering Intern", "Applied Scientist Intern", "Data Scientists Intern"):
+        assert spec.matches(title)[0], title
+    assert not spec.matches("Computer Science Teacher Intern")[0]                  # 'science' alone is not 'data science'
+    assert not spec.matches("Marketing Intern")[0]

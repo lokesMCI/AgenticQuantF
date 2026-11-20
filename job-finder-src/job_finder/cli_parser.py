@@ -69,7 +69,8 @@ def build_parser(version: str) -> argparse.ArgumentParser:
     scanner_parser.add_argument("--skip-portals", type=str, default=None, help="Comma-separated list of job portals/boards to skip (e.g. 'targetjobs,reed,indeed')")
     scanner_parser.add_argument("--harvest", action="store_true", help="Harvest and validate fresh ATS company slugs (Ashby, Greenhouse, Lever) before scanning")
     # Retired: scan no longer applies. Kept (hidden) so old commands fail with a pointer to `apply`.
-    for _flag in ("--auto-apply", "--auto-submit", "--dry-run"):
+    scanner_parser.add_argument("--dry-run", action="store_true", help="Search and filter only: print the whole funnel and every dropped title, write nothing, score nothing")
+    for _flag in ("--auto-apply", "--auto-submit"):
         scanner_parser.add_argument(_flag, dest="retired_apply_flag", action="store_true", help=argparse.SUPPRESS)
     for _flag in ("--timeout", "--tailor-timeout", "--max-steps", "--model"):
         scanner_parser.add_argument(_flag, dest="retired_apply_opt", default=None, help=argparse.SUPPRESS)
