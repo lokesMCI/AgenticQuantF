@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# job-finder-ai runtime data (resumes, profile, tracker, browser sessions)
+output/
+uploads/
+user_data/
+applications_tracker/
+candidate_profile.json
+*.enc
