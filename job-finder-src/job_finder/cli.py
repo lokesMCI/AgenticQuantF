@@ -127,6 +127,10 @@ def _main():
         from job_finder.commands.approve import run as _run
         _run(args)
 
+    elif args.subcommand == "boards":
+        from job_finder.commands.boards import run as _run
+        _run(args)
+
     elif args.subcommand == "prepare":
         from job_finder.commands.prepare import run as _run
         _run(args)

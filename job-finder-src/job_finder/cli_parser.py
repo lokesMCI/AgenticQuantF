@@ -69,6 +69,7 @@ def build_parser(version: str) -> argparse.ArgumentParser:
     scanner_parser.add_argument("--skip-portals", type=str, default=None, help="Comma-separated list of job portals/boards to skip (e.g. 'targetjobs,reed,indeed')")
     scanner_parser.add_argument("--harvest", action="store_true", help="Harvest and validate fresh ATS company slugs (Ashby, Greenhouse, Lever) before scanning")
     # Retired: scan no longer applies. Kept (hidden) so old commands fail with a pointer to `apply`.
+    scanner_parser.add_argument("--no-boards", action="store_true", help="Skip the company-board index (Greenhouse / Lever / Ashby boards)")
     scanner_parser.add_argument("--dry-run", action="store_true", help="Search and filter only: print the whole funnel and every dropped title, write nothing, score nothing")
     for _flag in ("--auto-apply", "--auto-submit"):
         scanner_parser.add_argument(_flag, dest="retired_apply_flag", action="store_true", help=argparse.SUPPRESS)
@@ -125,6 +126,15 @@ def build_parser(version: str) -> argparse.ArgumentParser:
     review_parser.add_argument("--open", type=int, default=None, metavar="ID", help="Open this job's pack folder")
     review_parser.add_argument("--ok", type=str, default=None, help="Sign off these IDs (comma-separated): you reviewed the CV / cover letter")
     review_parser.add_argument("--revoke", type=str, default=None, help="Take the sign-off back for these IDs")
+
+    # 2b4. Company-board index
+    boards_parser = subparsers.add_parser("boards", help="Build/inspect the index of open London/UK jobs on thousands of Greenhouse, Lever and Ashby boards")
+    boards_parser.add_argument("action", choices=["refresh", "status"], help="refresh = (re)visit the boards, status = show what is indexed")
+    boards_parser.add_argument("--ats", type=str, default=None, help="Comma-separated subset: greenhouse,lever,ashby")
+    boards_parser.add_argument("--limit", type=int, default=None, help="Only visit this many boards (to try it out)")
+    boards_parser.add_argument("--force", action="store_true", help="Re-visit every board, ignoring how recently it was checked")
+    boards_parser.add_argument("--location", type=str, default=None, help="City to index (default: first target_locations entry)")
+    boards_parser.add_argument("--concurrency", type=int, default=24, help="Parallel requests (default 24)")
 
     # 2c. Open subcommand
     open_parser = subparsers.add_parser("open", help="Open the scanned or approved Excel file")

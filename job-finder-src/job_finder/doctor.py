@@ -77,6 +77,19 @@ def collect_checks() -> List[Dict[str, str]]:
         add("master_resume", "fail", (f"MASTER_RESUME_PATH points to a file that does not exist: {resume}" if resume
                                       else "MASTER_RESUME_PATH is not set") + "; `apply` needs your resume PDF to upload")
 
+    add("adzuna_api", "ok" if _env_set("ADZUNA_APP_ID") and _env_set("ADZUNA_APP_KEY") else "warn",
+        "configured" if _env_set("ADZUNA_APP_ID") and _env_set("ADZUNA_APP_KEY") else "optional: free key at developer.adzuna.com adds many UK boards")
+    add("reed_api", "ok" if _env_set("REED_API_KEY") else "warn",
+        "configured" if _env_set("REED_API_KEY") else "optional: free key at reed.co.uk/developers adds Reed jobs")
+    try:
+        from backend.services import board_index as _bi
+        _st = _bi.status()
+        add("board_index", "ok" if _st.get("exists") and _st.get("local_jobs") else "warn",
+            f"{_st['local_jobs']} open local jobs, last refreshed {_st['age_hours']}h ago" if _st.get("exists") and _st.get("local_jobs")
+            else "empty: run `./jf boards refresh` to search thousands of company boards")
+    except Exception:
+        pass
+
     mail = _env_set("BREVO_API_KEY") or _env_set("RESEND_API_KEY") or _env_set("SMTP_USER")
     add("email_provider", "ok" if mail else "warn", "configured" if mail else "no SMTP/Brevo/Resend; notifications disabled")
     add("notify_email", "ok" if _env_set("NOTIFY_EMAIL") else "warn",

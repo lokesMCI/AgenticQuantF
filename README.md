@@ -51,6 +51,7 @@ Then fill in the two private files that `setup.sh` created (both are git-ignored
 ```bash
 ./jf doctor                 # health check: every line should say ok (warn lines are optional)
 ./jf profile --show         # re-read your profile once and make sure it is all true
+./jf boards refresh         # build the company-board index (about 6 minutes, then refresh weekly)
 ./jf ats                    # optional: resume health audit (what your target roles expect vs what your profile shows)
 ./jf ats --add-skills       # optional: add skills your profile evidences but does not list (asks first, makes a backup)
 ```
@@ -83,6 +84,25 @@ Useful options: `--limit 20`, `--min-ats 70`, `--loose` (also read descriptions)
 **`./jf scan ... --dry-run`** is a search-only test: it writes nothing and scores nothing, and prints the whole funnel (postings found per source, how many each stage removed, and *every* removed title with its reason). Use it whenever the number of saved jobs surprises you.
 
 > **Why "130 found" can become 15 saved:** "found" counts everything every source returned. Job boards like Jobserve and Indeed ignore "Intern" and return permanent roles, which the level filter removes; jobs already in your tracker are skipped; off-topic titles are dropped. Real internships come mostly from LinkedIn. **Internships stay open for weeks, so use a month window (`--timeframe 1m`, or `timeframe` in your profile) for the first scans** (a one-week window found 1 new applied-AI internship, a month found about 20).
+
+#### Where the jobs come from
+
+| Source | How | Needs |
+|---|---|---|
+| **Company career boards** (Greenhouse, Lever, Ashby): ~15,000 companies | public job APIs, indexed locally by `./jf boards refresh` | nothing (run the refresh once, then about weekly) |
+| LinkedIn | public guest search | nothing |
+| Indeed, Jobserve, TargetJobs, Reed | existing scrapers/APIs | Reed needs a free `REED_API_KEY`; Indeed often blocks automated access |
+| **Adzuna** (aggregates many UK boards) | official API | free `ADZUNA_APP_ID` + `ADZUNA_APP_KEY` (https://developer.adzuna.com) |
+| Reddit / Hacker News hiring threads | leads only (not saved as jobs) | nothing |
+
+```bash
+./jf boards refresh      # builds data/board_index.db: every open London/UK role on ~8,500 reachable boards (about 6 minutes)
+./jf boards status       # what is indexed and how old it is
+```
+
+Scans search that index instantly, so a scan covers thousands of employers (direct application links, which are better to apply through than aggregator links). When the same job appears on LinkedIn and on the company's own board it is saved **once, with the company's link**. Board jobs are *currently open* postings, so the time window does not apply to them. `./jf scan ... --no-boards` skips the index.
+
+**Sites that are deliberately not scraped:** Glassdoor, Monster, CV-Library, Milkround, Gradcracker and Jooble block automated access (403 / bot protection) and their terms forbid scraping; Trackr and Jack & Jill have no public job listings (login-only app / recruiter chat). Adzuna and Reed (official APIs) are the legitimate way to cover many of those boards' jobs.
 
 ### Step 2: Review in Excel and approve
 
@@ -183,6 +203,8 @@ AgenticQuantF/                      (your working folder; everything below marke
 │
 └── data/                                 private caches (safe to delete)
     ├── topic_terms.json                  the field map per topic: EDITABLE (include / exclude / search)
+    ├── board_index.db                    open London/UK jobs from ~8,500 company career boards (`./jf boards refresh`)
+    ├── board_seeds.json                  the list of company boards to visit (refreshed weekly)
     ├── fit_cache.db                      cached fit analyses (stable scores, no repeat LLM calls)
     └── jd_cache.db …                     cached job pages
 ```
@@ -226,6 +248,7 @@ The model never writes a free-form CV. It returns a **plan over your existing ma
 
 ```bash
 ./jf doctor                                   # health check
+./jf boards refresh                           # 0. (weekly) index ~8,500 company boards
 ./jf topic cyber security                     # what a topic covers (--refresh to rebuild)
 ./jf scan cyber security internships          # 1. find + score jobs  -> scanned_jobs.xlsx
 ./jf open                                     # 2. review in Excel, tick Approve = Yes

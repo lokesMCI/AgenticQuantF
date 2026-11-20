@@ -673,6 +673,8 @@ async def discover_jobs(
     skip_portals: Optional[str] = None,
     top_applicant_only: Optional[bool] = None,
     headless: Optional[bool] = None,
+    title_filter: Optional[Any] = None,
+    use_boards: bool = True,
 ):
     """
     Multi-source discovery (ATS portals + LinkedIn + Indeed + Reed + Jobserve + community threads).
@@ -771,7 +773,65 @@ async def discover_jobs(
                     merged_count += 1
         except Exception as comm_err:
             print(f"[Scanner] Note: Community unlisted job search skipped: {comm_err}")
+    # ── extra sources: the company-board index (thousands of Greenhouse/Lever/Ashby boards) + Adzuna (if keyed) ──
+    if not top_applicant_only:
+        have = {normalize_job_url(j.get("url", "")) for j in jobs if j.get("url")}
+        extra: list = []
+        if use_boards:
+            try:
+                from services import board_index as _bi
+                if title_filter is None:      # no topic filter: match on the words of the searched roles
+                    words = {w.lower() for r in target_roles for w in re.findall(r"[A-Za-z]{3,}", r)} - {"intern", "internship", "engineer", "senior"}
+                    title_filter = lambda t: any(w in (t or "").lower() for w in words)  # noqa: E731
+                found, st = _bi.search(title_filter, location)
+                if st["boards"] == 0:
+                    print("[Sources] Company-board index is empty: run `job-finder boards refresh` once to search "
+                          "thousands of Greenhouse / Lever / Ashby boards.")
+                else:
+                    print(f"[Sources] Company boards: {st['boards']} boards indexed, {st['local_jobs']} open jobs in "
+                          f"{location.split(',')[0]}, {st['matched']} match your topic.")
+                    age = (_bi.status().get("age_hours") or 0)
+                    if age > 72:
+                        print(f"[Sources] The company-board index is {age / 24:.0f} days old: run `job-finder boards refresh` (about 6 minutes).")
+                extra += found
+            except Exception as be:
+                print(f"[Sources] Company-board index skipped: {be}")
+        try:
+            from services import aggregators as _ag
+            if _ag.adzuna_configured():
+                az = await _ag.search_adzuna(target_roles, location, timeframe)
+                print(f"[Sources] Adzuna: {len(az)} postings.")
+                extra += az
+            else:
+                print("[Sources] Adzuna not configured (free key: ADZUNA_APP_ID / ADZUNA_APP_KEY in .env).")
+        except Exception as ae:
+            print(f"[Sources] Adzuna skipped: {ae}")
+        added_extra = 0
+        for j in extra:
+            u = normalize_job_url(j.get("url", ""))
+            if u and u not in have:
+                have.add(u)
+                jobs.append(j)
+                added_extra += 1
+        merged_count += added_extra
     return jobs, merged_count
+
+
+_DIRECT_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "workable.com", "smartrecruiters.com", "myworkdayjobs.com", "bamboohr.com")
+
+
+def _is_direct(job: dict) -> bool:
+    """A link on the employer's own applicant-tracking system (best to apply through) rather than an aggregator."""
+    u = (job.get("url") or "").lower()
+    src = str(job.get("source") or job.get("platform") or "").lower()
+    # Greenhouse/Lever often return links on the employer's OWN domain (e.g. company.com/careers?gh_jid=1), so also
+    # trust postings that came from an ATS board API rather than from an aggregator.
+    return any(h in u for h in _DIRECT_HOSTS) or any(a in src for a in ("greenhouse", "lever", "ashby", "workday", "bamboo", "workable"))
+
+
+def _dup_key(job: dict) -> str:
+    norm = lambda x: re.sub(r"[^a-z0-9]+", " ", str(x or "").lower()).strip()  # noqa: E731
+    return norm(job.get("company")) + "|" + norm(job.get("title"))
 
 
 IRRELEVANT_TITLE_KEYWORDS = (
@@ -893,6 +953,7 @@ async def run_scan(
     exact: bool = False,
     ai_score: bool = True,
     dry_run: bool = False,
+    use_boards: bool = True,
 ) -> dict:
     """
     Discover jobs and save them to the Excel tracker. Nothing is tailored or submitted.
@@ -945,6 +1006,7 @@ async def run_scan(
     jobs, _ = await discover_jobs(
         target_roles=target_roles, location=location, timeframe=timeframe, prefs=prefs,
         skip_portals=skip_portals, top_applicant_only=top_applicant_only, headless=headless,
+        title_filter=(lambda t: spec.matches(t or "")[0]) if spec else None, use_boards=use_boards,
     )
     print(f"\n[Scan] {len(jobs)} postings discovered across sources.")
 
@@ -953,6 +1015,7 @@ async def run_scan(
     counts = {"duplicate": 0, "irrelevant": 0, "non_sponsor": 0, "no_url": 0, "not_a_job": 0, "off_topic": 0}
     fresh = []
     dropped = []  # (title, company, reason) for jobs the topic/level filter rejected, shown so you can sanity-check it
+    by_key = {}   # company+title -> the kept posting, so the same job from two sites is saved once
     drops = []    # every job removed at any stage: (stage, title, company, source, reason)
     src_of = lambda j: str(j.get("source") or j.get("platform") or "?")  # noqa: E731
     check_uk_sponsor = None
@@ -1000,6 +1063,20 @@ async def run_scan(
             drops.append(("not a UK sponsor", job.get("title") or "", job.get("company") or "", src_of(job), "company not on the sponsor register"))
             continue
         job["_uk_sponsor"] = sponsor
+        key = _dup_key(job)
+        if key in by_key:
+            prev = by_key[key]
+            if _is_direct(job) and not _is_direct(prev):
+                fresh[fresh.index(prev)] = job            # keep the employer's own link, drop the aggregator copy
+                drops.append(("same job, other site", prev.get("title") or "", prev.get("company") or "", src_of(prev),
+                              f"kept the direct {src_of(job)} link instead"))
+                by_key[key] = job
+            else:
+                drops.append(("same job, other site", job.get("title") or "", job.get("company") or "", src_of(job),
+                              f"already have it from {src_of(prev)}"))
+            counts["duplicate"] += 1
+            continue
+        by_key[key] = job
         fresh.append(job)
 
     if dry_run:
