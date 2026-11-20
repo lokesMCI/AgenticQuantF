@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Launcher for the job-finder CLI in ./job-finder-src.
+#   ./jf scan cyber security internships
+# It pins the workspace to THIS folder, so .env, candidate_profile.json, the Excel trackers and the
+# application packs are always read from / written next to this script, wherever you run it from.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export JOB_FINDER_ROOT="${JOB_FINDER_ROOT:-$ROOT}"
+export JOB_FINDER_NO_UPDATE_CHECK=1   # we run from source; do not nag about a PyPI release
+
+for venv in "${JOB_FINDER_VENV:-}" "$ROOT/.venv" "$ROOT/.auto_apply"; do
+  if [ -n "$venv" ] && [ -x "$venv/bin/job-finder" ]; then
+    exec "$venv/bin/job-finder" "$@"
+  fi
+done
+
+echo "No virtual environment found. Run ./setup.sh first." >&2
+exit 1

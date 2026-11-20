@@ -1,0 +1,518 @@
+import os
+import re
+import json
+# pyrefly: ignore [missing-import]
+from pypdf import PdfReader
+# pyrefly: ignore [missing-import]
+from docx import Document
+# pyrefly: ignore [missing-import]
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Union, Any
+# pyrefly: ignore [missing-import]
+from services.gemini_client import generate_content_with_fallback
+
+class WorkExperience(BaseModel):
+    company: str
+    role: str
+    start_date: str
+    end_date: str
+    technologies: Optional[str] = Field(default="", description="Technologies list under role e.g. 'Python, C++, Jedi, Jenkins...'")
+    description: List[str]
+
+class Education(BaseModel):
+    institution: str
+    degree: str
+    field_of_study: Optional[str] = Field(default="")
+    start_date: Optional[str] = Field(default="", description="Start date e.g. 'Sept 2026' or 'Aug 2019'")
+    graduation_date: str = Field(description="Graduation or end date / range e.g. 'Sept 2027', 'May 2023', or 'Sept 2026 – Sept 2027'")
+    location: Optional[str] = Field(default="", description="City/Country e.g. 'London, UK'")
+    gpa: Optional[str] = Field(default=None, description="GPA, CPI, percentage, or grade score e.g. 'CPI: 8.04' or '94.2%'")
+    highlights: List[str] = Field(default_factory=list, description="Leadership roles, coordinator roles, or bullet highlights under education")
+
+class Project(BaseModel):
+    title: str
+    technologies: List[str] = Field(default_factory=list, description="Technologies / tools / frameworks used in project e.g. ['Python', 'Docker', 'FastAPI']")
+    url: Optional[str] = Field(default="", description="Repository, live demo, or deployment URL (e.g. GitHub link)")
+    description: List[str]
+
+def sanitize_resume_summary(summary_val: Any) -> str:
+    """Ensures summary is a clean text paragraph and not serialized JSON."""
+    if not summary_val:
+        return ""
+    if isinstance(summary_val, dict):
+        return sanitize_resume_summary(summary_val.get("summary", ""))
+
+    if isinstance(summary_val, str):
+        s = summary_val.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict) and "summary" in parsed:
+                    return sanitize_resume_summary(parsed["summary"])
+                return ""
+            except Exception:
+                pass
+        return s
+
+    return str(summary_val)
+
+
+class StructuredResume(BaseModel):
+    name: str
+    email: str
+    phone: str
+    location: Optional[str] = Field(default="", description="Candidate location/city/country (e.g. London, UK)")
+    links: List[str]
+    summary: str = Field(default="", description="A short professional summary paragraph (2-3 sentences) describing candidate background and expertise. NEVER serialize full resume JSON into this field.")
+    skills: Union[Dict[str, List[str]], List[str]]
+    experience: List[WorkExperience]
+    education: List[Education]
+    projects: List[Project] = Field(default_factory=list)
+    achievements: List[str] = Field(default_factory=list, description="Achievements & Leadership list items")
+
+def extract_text_from_pdf(file_path: str) -> str:
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+def extract_text_from_docx(file_path: str) -> str:
+    doc = Document(file_path)
+    text = []
+    for para in doc.paragraphs:
+        text.append(para.text)
+    return "\n".join(text)
+
+class CategorizedSkillItem(BaseModel):
+    skill: str = Field(description="Normalized skill name")
+    category: str = Field(description="One of the categories e.g. Languages, AI/ML & GenAI, Data & Analytics, Frontend & Web, DevOps & Cloud, Testing & QA, Finance & Quant, Software & Systems")
+
+class SkillsCategorizationResponse(BaseModel):
+    categorized: List[CategorizedSkillItem] = Field(default_factory=list)
+
+KNOWN_SKILL_CATEGORY_MAP = {
+    # Languages
+    "python": "Languages", "sql": "Languages", "c++": "Languages", "java": "Languages", "c#": "Languages",
+    "c": "Languages", "r": "Languages", "golang": "Languages", "go": "Languages", "typescript": "Languages",
+    "javascript": "Languages", "rust": "Languages", "bash": "Languages", "shell": "Languages", "scala": "Languages",
+    "kotlin": "Languages", "swift": "Languages", "php": "Languages", "ruby": "Languages", "perl": "Languages", "matlab": "Languages",
+    # AI/ML & GenAI
+    "ai": "AI/ML & GenAI", "ml": "AI/ML & GenAI", "genai": "AI/ML & GenAI", "llm": "AI/ML & GenAI", "rag": "AI/ML & GenAI",
+    "machine learning": "AI/ML & GenAI", "deep learning": "AI/ML & GenAI", "pytorch": "AI/ML & GenAI", "tensorflow": "AI/ML & GenAI",
+    "keras": "AI/ML & GenAI", "scikit-learn": "AI/ML & GenAI", "sklearn": "AI/ML & GenAI", "opencv": "AI/ML & GenAI",
+    "langchain": "AI/ML & GenAI", "llamaindex": "AI/ML & GenAI", "huggingface": "AI/ML & GenAI", "computer vision": "AI/ML & GenAI",
+    "nlp": "AI/ML & GenAI", "transformers": "AI/ML & GenAI", "xgboost": "AI/ML & GenAI",
+    # Data & Analytics
+    "pyspark": "Data & Analytics", "postgresql": "Data & Analytics", "postgres": "Data & Analytics", "sas": "Data & Analytics",
+    "spark": "Data & Analytics", "hive": "Data & Analytics", "snowflake": "Data & Analytics", "bigquery": "Data & Analytics",
+    "redshift": "Data & Analytics", "mongodb": "Data & Analytics", "mongo": "Data & Analytics", "redis": "Data & Analytics",
+    "mysql": "Data & Analytics", "oracle": "Data & Analytics", "elasticsearch": "Data & Analytics", "kafka": "Data & Analytics",
+    "airflow": "Data & Analytics", "databricks": "Data & Analytics", "hadoop": "Data & Analytics", "pandas": "Data & Analytics",
+    "numpy": "Data & Analytics", "power bi": "Data & Analytics", "powerbi": "Data & Analytics", "tableau": "Data & Analytics",
+    # Frontend & Web
+    "react": "Frontend & Web", "react.js": "Frontend & Web", "next.js": "Frontend & Web", "nextjs": "Frontend & Web",
+    "vue": "Frontend & Web", "vue.js": "Frontend & Web", "angular": "Frontend & Web", "svelte": "Frontend & Web",
+    "html": "Frontend & Web", "html5": "Frontend & Web", "css": "Frontend & Web", "css3": "Frontend & Web",
+    "tailwind": "Frontend & Web", "bootstrap": "Frontend & Web", "webpack": "Frontend & Web", "vite": "Frontend & Web",
+    # DevOps & Cloud
+    "docker": "DevOps & Cloud", "kubernetes": "DevOps & Cloud", "k8s": "DevOps & Cloud", "helm": "DevOps & Cloud",
+    "terraform": "DevOps & Cloud", "aws": "DevOps & Cloud", "gcp": "DevOps & Cloud", "azure": "DevOps & Cloud",
+    "jenkins": "DevOps & Cloud", "github actions": "DevOps & Cloud", "rancher": "DevOps & Cloud", "git": "DevOps & Cloud",
+    # Testing & QA
+    "pytest": "Testing & QA", "unittest": "Testing & QA", "junit": "Testing & QA", "selenium": "Testing & QA",
+    "cypress": "Testing & QA", "playwright": "Testing & QA", "jest": "Testing & QA",
+    # Methodologies & Process
+    "requirements gathering": "Methodologies & Process", "gap analysis": "Methodologies & Process", "user stories": "Methodologies & Process",
+    "brd": "Methodologies & Process", "brds": "Methodologies & Process", "frd": "Methodologies & Process", "process mapping": "Methodologies & Process",
+    "stakeholder management": "Methodologies & Process", "agile": "Methodologies & Process", "scrum": "Methodologies & Process",
+    "jira": "Methodologies & Process", "confluence": "Methodologies & Process", "agile / scrum": "Methodologies & Process"
+}
+
+def _split_skills_preserving_groups(skills_str: str) -> List[str]:
+    """
+    Splits a comma-separated skills line while respecting parentheses, brackets,
+    and multi-word grouped phrases (e.g. 'Computer Vision (U-Net, DenseNet)').
+    """
+    if not skills_str:
+        return []
+    raw_items = [s.strip() for s in skills_str.split(",") if s.strip()]
+    clean_items: List[str] = []
+    temp = ""
+    for it in raw_items:
+        if temp:
+            temp += ", " + it
+            if ")" in it or "]" in it or "}" in it:
+                clean_items.append(temp.strip())
+                temp = ""
+        elif (("(" in it and ")" not in it) or 
+              ("[" in it and "]" not in it) or 
+              ("{" in it and "}" not in it)):
+            temp = it
+        else:
+            clean_items.append(it.strip())
+    if temp:
+        clean_items.append(temp.strip())
+    return [c for c in clean_items if c]
+
+def categorize_skills_with_llm(raw_skills: Union[str, List[str]]) -> Dict[str, List[str]]:
+    """
+    Hybrid Skill Categorization Engine:
+    1. Deterministic Dictionary Map for 80% known skills (instant, 0 latency, 0 hallucination).
+    2. LLM Fallback Call for remaining unknown/unclassified skills with temperature=0.
+    """
+    if isinstance(raw_skills, list):
+        skill_items = [s.strip() for s in raw_skills if s and s.strip()]
+    else:
+        skill_items = [s.strip() for s in raw_skills.split(",") if s.strip()]
+
+    result_categories: Dict[str, List[str]] = {}
+    unknown_skills: List[str] = []
+
+    # Step 1: Deterministic dictionary mapping
+    for s in skill_items:
+        s_clean = s.strip()
+        if not s_clean or len(s_clean) > 50:
+            continue
+        cat = KNOWN_SKILL_CATEGORY_MAP.get(s_clean.lower())
+        if cat:
+            result_categories.setdefault(cat, [])
+            if s_clean not in result_categories[cat]:
+                result_categories[cat].append(s_clean)
+        else:
+            unknown_skills.append(s_clean)
+
+    # Step 2: LLM Fallback for remaining unknown skills
+    if unknown_skills:
+        prompt = f"""
+You are a skill categorization engine. You will be given a list of skills and a set of categories.
+Assign each skill to exactly ONE category — the single best fit.
+
+CATEGORIES:
+1. Languages — programming languages (e.g. C++, Java, Rust, Go, Python, SQL, R).
+2. AI/ML & GenAI — machine learning models, frameworks, AI tools, LLMs (e.g. PyTorch, LangChain, Transformers).
+3. Data & Analytics — databases, query tools, BI, data processing engines (e.g. PostgreSQL, Spark, Tableau, Power BI, Excel).
+4. Methodologies & Process — project management, process frameworks, requirements, user stories, BRDs, Agile, Scrum, Jira.
+5. Frontend & Web — web development frameworks, UI tools, web tech (e.g. React, HTML, CSS).
+6. DevOps & Cloud — cloud platforms, containerization, CI/CD, VCS (e.g. AWS, Docker, Git, Jenkins).
+7. Testing & QA — automation frameworks, testing tools (e.g. Selenium, Cypress).
+8. Finance & Quant — risk modeling, quantitative finance, financial tools (e.g. Black-Scholes, Monte Carlo).
+9. Software & Systems — software architecture, developer tools, system libraries (e.g. RabbitMQ, AST Parsing, Microservices).
+
+RULES:
+- Normalize near-duplicate names before categorizing (e.g. "PowerBI" → "Power BI").
+- Do NOT invent skills that were not in the input list. Do NOT skip any input skill.
+- Output ONLY valid JSON matching the schema.
+
+SKILLS TO CATEGORIZE:
+{", ".join(unknown_skills)}
+"""
+        try:
+            response_text = generate_content_with_fallback(prompt, SkillsCategorizationResponse)
+            parsed = json.loads(response_text)
+            items = parsed.get("categorized", [])
+            for item in items:
+                if isinstance(item, dict):
+                    sk = item.get("skill", "").strip()
+                    cat = item.get("category", "Software & Systems").strip()
+                    if sk and len(sk) < 50:
+                        result_categories.setdefault(cat, [])
+                        if sk not in result_categories[cat]:
+                            result_categories[cat].append(sk)
+        except Exception as e:
+            print(f"[categorize_skills_with_llm] Hybrid LLM fallback error: {e}")
+            for sk in unknown_skills:
+                result_categories.setdefault("Software & Systems", [])
+                if sk not in result_categories["Software & Systems"]:
+                    result_categories["Software & Systems"].append(sk)
+
+    res_cats = {k: v for k, v in result_categories.items() if v}
+    return res_cats if res_cats else {"Technical Skills": skill_items}
+
+def _deterministic_offline_resume_parser(raw_text: str, ext: str) -> Dict[str, Any]:
+    """
+    High-accuracy deterministic regex/structural parser used when LLM calls are unavailable,
+    offline, rate-limited, or encountering DNS/network connection drops.
+    """
+    parsed: Dict[str, Any] = {
+        "name": "Candidate",
+        "email": "",
+        "phone": "",
+        "location": "",
+        "links": [],
+        "summary": "",
+        "skills": {},
+        "experience": [],
+        "education": [],
+        "projects": [],
+        "achievements": []
+    }
+
+    # 1. Candidate Name Extraction
+    if ext == '.tex':
+        name_m = re.search(r"\\name\{([^}]+)\}", raw_text)
+        if not name_m:
+            name_m = re.search(r"\\textbf\{\\LARGE\s+([^}]+)\}", raw_text)
+        if not name_m:
+            name_m = re.search(r"\\Huge\\scshape\s+([^\\]+)", raw_text)
+        if name_m:
+            parsed["name"] = name_m.group(1).replace(r"\bf", "").strip()
+    else:
+        # First non-empty lines
+        for line in raw_text.split("\n")[:5]:
+            l = line.strip()
+            if l and not re.search(r"[@\+\d\(\)]", l) and len(l) < 50:
+                # Clean kerning anomalies like P A L L A V I -> PALLAVI
+                if re.match(r"^([A-Z]\s+){2,}[A-Z]$", l):
+                    l = re.sub(r"\s+", "", l)
+                parsed["name"] = l
+                break
+
+    # 2. Email Extraction
+    email_m = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", raw_text)
+    if email_m:
+        parsed["email"] = email_m[0].strip()
+
+    # 3. Phone Extraction
+    phone_m = re.findall(r"(?:(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,5}\)?[-.\s]?\d{3,5}[-.\s]?\d{3,5})", raw_text)
+    for p in phone_m:
+        p_clean = p.strip()
+        if len(re.sub(r"\D", "", p_clean)) >= 9:
+            parsed["phone"] = p_clean
+            break
+
+    # 4. Links Extraction (LinkedIn, GitHub, Portfolios)
+    links_m = re.findall(r"(?:https?://[^\s)\]\"'>]+|(?:linkedin\.com/in/[^\s)\]\"'>]+)|(?:github\.com/[^\s)\]\"'>]+))", raw_text, re.IGNORECASE)
+    clean_links = []
+    for lk in links_m:
+        lk_clean = lk.strip()
+        if not lk_clean.startswith("http"):
+            lk_clean = "https://" + lk_clean
+        if lk_clean not in clean_links:
+            clean_links.append(lk_clean)
+    parsed["links"] = clean_links
+
+    # 5. Location Extraction
+    loc_m = re.search(r"([A-Z][a-zA-Z\s]+,\s*(?:UK|United Kingdom|USA|US|India|London|England|Scotland|Wales|Canada|Germany|France|Singapore))", raw_text)
+    if loc_m:
+        parsed["location"] = loc_m.group(1).strip()
+
+    # 6. Education Extraction (.tex and text)
+    if ext == '.tex':
+        edu_sec = re.search(r"\\begin\{rSection\}\{Education\}(.*?)\\end\{rSection\}", raw_text, re.DOTALL | re.IGNORECASE)
+        if edu_sec:
+            subsections = re.findall(r"\\begin\{rSubsection\}\{([^}]+)\}\{([^}]+)\}\{([^}]+)\}\{([^}]*)\}(.*?)\\end\{rSubsection\}", edu_sec.group(1), re.DOTALL)
+            for inst, dates, deg, loc, body in subsections:
+                bullets = [re.sub(r"^\s*\\item\s*", "", b).strip() for b in body.split("\n") if r"\item" in b]
+                parsed["education"].append({
+                    "institution": inst.strip(),
+                    "degree": deg.strip(),
+                    "field_of_study": "",
+                    "start_date": "",
+                    "graduation_date": dates.strip(),
+                    "location": loc.strip(),
+                    "gpa": None,
+                    "highlights": bullets
+                })
+
+        # Experience Extraction (.tex)
+        exp_sec = re.search(r"\\begin\{rSection\}\{(?:Experience|Work Experience|Employment History)\}(.*?)\\end\{rSection\}", raw_text, re.DOTALL | re.IGNORECASE)
+        if exp_sec:
+            subsections = re.findall(r"\\begin\{rSubsection\}\{([^}]+)\}\{([^}]+)\}\{([^}]+)\}\{([^}]*)\}(.*?)\\end\{rSubsection\}", exp_sec.group(1), re.DOTALL)
+            for comp, dates, role, loc, body in subsections:
+                bullets = [re.sub(r"^\s*\\item\s*", "", b).strip() for b in body.split("\n") if r"\item" in b]
+                parsed["experience"].append({
+                    "company": comp.strip(),
+                    "role": role.strip(),
+                    "start_date": "",
+                    "end_date": dates.strip(),
+                    "technologies": "",
+                    "description": bullets
+                })
+
+        # Projects Extraction (.tex)
+        proj_sec = re.search(r"\\begin\{rSection\}\{(?:Projects|Technical Projects|Personal Projects)\}(.*?)\\end\{rSection\}", raw_text, re.DOTALL | re.IGNORECASE)
+        if proj_sec:
+            subsections = re.findall(r"\\begin\{rSubsection\}\{([^}]+)\}\{([^}]*)\}\{([^}]*)\}\{([^}]*)\}(.*?)\\end\{rSubsection\}", proj_sec.group(1), re.DOTALL)
+            for title, dates, tech, link, body in subsections:
+                bullets = [re.sub(r"^\s*\\item\s*", "", b).strip() for b in body.split("\n") if r"\item" in b]
+                tech_list = [t.strip() for t in tech.replace(r"\&", "&").split(",") if t.strip()] if tech else []
+                parsed["projects"].append({
+                    "title": title.strip(),
+                    "technologies": tech_list,
+                    "url": link.strip(),
+                    "description": bullets
+                })
+
+        # Achievements Extraction (.tex)
+        ach_sec = re.search(r"\\begin\{rSection\}\{(?:Achievements|Leadership|Honors|Awards)[^}]*\}(.*?)\\end\{rSection\}", raw_text, re.DOTALL | re.IGNORECASE)
+        if ach_sec:
+            bullets = [re.sub(r"^\s*\\item\s*", "", b).strip() for b in ach_sec.group(1).split("\n") if r"\item" in b]
+            parsed["achievements"] = [b for b in bullets if b]
+
+    return parsed
+
+
+def parse_resume(file_path: str) -> StructuredResume:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == '.pdf':
+        raw_text = extract_text_from_pdf(file_path)
+    elif ext in ['.docx', '.doc']:
+        raw_text = extract_text_from_docx(file_path)
+    elif ext == '.tex':
+        with open(file_path, 'r', encoding='utf-8') as f:
+            raw_text = f.read()
+    else:
+        raise ValueError("Unsupported file format. Please upload PDF, DOCX, or TEX.")
+
+    if not raw_text or not raw_text.strip():
+        raise ValueError("Could not extract text from resume. Please ensure the file is not empty or corrupted.")
+
+    prompt = f"""
+    You are an expert resume parsing AI. Extract all information from the raw resume text below and organize it into a structured object matching the schema.
+
+    CRITICAL RULES:
+    1. Clean up any spacing or kerning anomalies in the candidate's name (e.g. "P A L L A V I" → "PALLAVI").
+    2. Extract ALL URLs from the resume into the `links` array. This MUST include LinkedIn URLs (e.g. https://linkedin.com/in/username), GitHub URLs, portfolios, etc. Do NOT leave `links` empty if URLs are present.
+    3. TECHNICAL SKILLS CATEGORIZATION (ABSOLUTE MANDATORY):
+       - If the resume already organizes skills under category headings (e.g. "Languages:", "AI/ML & GenAI:", "Data & Platforms:", "Software & Infrastructure:"), you MUST extract `skills` as a JSON object / dictionary where the keys are the EXACT category headings from the resume, and values are arrays of strings for every skill under that category.
+       - NEVER reorganize, reclassify, summarize, or move skills between categories if the candidate already categorized them!
+       - Extract ALL skills explicitly mentioned in the raw resume text below. Do NOT drop, truncate, or summarize long lists. Extract every single technology, language, framework, database, methodology, and tool listed.
+       - Do NOT invent or copy skills from any external template!
+    4. For each Education entry, extract:
+       - Full start date AND graduation date (e.g. "Sept 2026 – Sept 2027", "Aug 2019 – May 2023"). Do NOT drop the start/end dates.
+       - City/Country location if listed (e.g. "London, UK").
+       - GPA, CPI, percentage, or grade score into the `gpa` field (e.g. "CPI: 8.04", "94.2%").
+       - Leadership/extracurricular/coordinator bullets into `highlights` (e.g. "Internship and Placement Cell Coordinator — Managed corporate outreach...").
+    5. Extract the phone number exactly as it appears.
+    6. WORK EXPERIENCE BULLETS & SUB-PROJECTS: If a work experience entry contains sub-project headers (e.g. "Quartz (Context-as-a-Service & LLM Engineering):"), do NOT duplicate the sub-project title prefix on every child bullet point! Keep the sub-project header distinct or keep individual accomplishment bullets clean.
+    7. WORK EXPERIENCE TECHNOLOGIES: If a work experience entry lists technologies under the role (e.g. "Technologies: Python, C++, Jedi, Jenkins..."), extract them into the `technologies` string field.
+    8. PROJECTS: For each project, extract:
+       - `title`: project title.
+       - `technologies`: list of technologies/tools mentioned in the project title, subtitle, or description (e.g. ["Python", "Docker", "FastAPI", "React"]).
+       - `url`: project link / repository URL / demo link if present (e.g. GitHub URL).
+       - `description`: list of accomplishment bullet points.
+
+    Raw Resume Text:
+    ---
+    {raw_text}
+    ---
+    """
+
+    try:
+        response_text = generate_content_with_fallback(prompt, StructuredResume)
+        parsed_data = json.loads(response_text)
+    except Exception as exc:
+        print(f"[parse_resume] LLM extraction unavailable ({exc}). Falling back to deterministic parser.")
+        parsed_data = _deterministic_offline_resume_parser(raw_text, ext)
+
+    # Validate that we got required fields
+    if not parsed_data.get("name"):
+        parsed_data["name"] = "Candidate"
+    if not parsed_data.get("email"):
+        parsed_data["email"] = ""
+    if not parsed_data.get("phone"):
+        parsed_data["phone"] = ""
+    if not parsed_data.get("location"):
+        # Infer location from candidate header or first education/experience entry if available
+        candidate_loc = ""
+        for edu in parsed_data.get("education", []):
+            if isinstance(edu, dict) and edu.get("location"):
+                candidate_loc = edu.get("location")
+                break
+        parsed_data["location"] = candidate_loc
+    if not parsed_data.get("links"):
+        parsed_data["links"] = []
+    parsed_data["summary"] = sanitize_resume_summary(parsed_data.get("summary", ""))
+    if not parsed_data.get("skills"):
+        parsed_data["skills"] = {}
+    if not parsed_data.get("experience"):
+        parsed_data["experience"] = []
+    if not parsed_data.get("education"):
+        parsed_data["education"] = []
+    if not parsed_data.get("projects"):
+        parsed_data["projects"] = []
+    if not parsed_data.get("achievements"):
+        parsed_data["achievements"] = []
+
+    # If input is a .tex file, deterministically extract pre-categorized Technical Skills directly
+    if ext == '.tex':
+        match = re.search(r"\\begin\{rSection\}\{Technical\s+Skills\}(.*?)\\end\{rSection\}", raw_text, re.DOTALL)
+        if match:
+            sec = match.group(1)
+            direct_skills = {}
+            for line in sec.split("\n"):
+                line = line.strip()
+                cat_match = re.search(r"\\textbf\{([^}]+?):?\}\s*:?\s*(.*)", line)
+                if cat_match:
+                    cat_name = cat_match.group(1).replace(":", "").replace(r"\&", "&").replace(r"\%", "%").strip()
+                    skills_part = cat_match.group(2).replace(r"\\", "").strip()
+                    clean_items = _split_skills_preserving_groups(skills_part)
+                    if cat_name and clean_items:
+                        direct_skills[cat_name] = clean_items
+            if direct_skills:
+                parsed_data["skills"] = direct_skills
+    elif ext in ['.pdf', '.docx', '.doc']:
+        # For PDF / DOCX: check if the document text already has labeled skill categories (e.g. "Languages: ...", "AI/ML & GenAI: ...")
+        skills_match = re.search(r"(?:TECHNICAL\s+SKILLS|Technical\s+Skills|SKILLS|Skills)\s*\n+(.*?)(?=\n+[A-Z\s]{4,}|\Z)", raw_text, re.DOTALL)
+        if skills_match:
+            sec_text = skills_match.group(1)
+            text_skills = {}
+            current_cat = None
+            for line in sec_text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                cat_m = re.match(r"^([A-Za-z0-9\s/&,+-]+?):\s*(.*)$", line)
+                if cat_m:
+                    current_cat = cat_m.group(1).strip()
+                    skills_str = cat_m.group(2).strip()
+                    text_skills[current_cat] = skills_str
+                elif current_cat:
+                    # Wrapped line continuation from the previous category
+                    text_skills[current_cat] += " " + line
+
+            parsed_res = {}
+            for cat_name, full_str in text_skills.items():
+                clean_items = _split_skills_preserving_groups(full_str)
+                if cat_name and clean_items:
+                    parsed_res[cat_name] = clean_items
+
+            if parsed_res and len(parsed_res) >= 2:
+                parsed_data["skills"] = parsed_res
+
+    # Auto-categorize skills using dedicated LLM call ONLY if no structured categories exist
+    raw_skills = parsed_data.get("skills")
+    if not isinstance(raw_skills, dict) or len(raw_skills) == 0 or sum(len(v) for v in raw_skills.values() if isinstance(v, list)) == 0:
+        if raw_skills and not isinstance(raw_skills, dict):
+            parsed_data["skills"] = categorize_skills_with_llm(raw_skills)
+        else:
+            # Fallback: Collect explicit technologies string from work experience entries
+            collected = []
+            for exp in parsed_data.get("experience", []):
+                if exp.get("technologies"):
+                    collected.extend([t.strip() for t in exp["technologies"].split(",") if t.strip()])
+            
+            if collected:
+                parsed_data["skills"] = categorize_skills_with_llm(list(set(collected)))
+            else:
+                parsed_data["skills"] = {}
+
+    # Post-process experience and project descriptions to ensure clean string representations
+    for item in parsed_data.get("experience", []):
+        if "description" in item and isinstance(item["description"], list):
+            cleaned_bullets = []
+            for b in item["description"]:
+                if isinstance(b, str):
+                    cleaned_bullets.append(b.strip())
+            item["description"] = cleaned_bullets
+
+    for proj in parsed_data.get("projects", []):
+        if "description" in proj and isinstance(proj["description"], list):
+            cleaned_bullets = []
+            for b in proj["description"]:
+                if isinstance(b, str):
+                    cleaned_bullets.append(b.strip())
+            proj["description"] = cleaned_bullets
+
+    return StructuredResume(**parsed_data)

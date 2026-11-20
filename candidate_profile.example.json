@@ -1,0 +1,142 @@
+{
+  "candidate": {
+    "user_id": 1,
+    "name": "Jane Doe",
+    "email": "jane.doe@example.com",
+    "phone": "+44 7000 000000",
+    "linkedin": "https://linkedin.com/in/janedoe",
+    "github": "https://github.com/janedoe",
+    "portfolio": "https://janedoe.dev",
+    "location": "London, UK",
+    "postal_code": "EC1A 1BB",
+    "gender": "Female",
+    "ethnicity": "Prefer not to say",
+    "citizenship": "United Kingdom",
+    "work_authorization": "Authorized to work in the UK without restriction",
+    "requires_sponsorship": false,
+    "veteran_status": "No",
+    "disability_status": "No",
+    "portals_password": "",
+    "experience_summary": "Replace with 2-3 sentences about you, built only from facts in your experience below. If it contains a number (for example a result), tailored CVs will keep it.",
+    "education": [
+      {
+        "institution": "University of Cambridge",
+        "degree": "B.A. in Computer Science",
+        "timeline": "2017 - 2020",
+        "location": "Cambridge, UK"
+      }
+    ],
+    "work_experience": [
+      {
+        "company": "Tech Innovations Ltd",
+        "role": "Senior Software Engineer",
+        "timeline": "2021 - Present",
+        "technologies": [
+          "Python",
+          "FastAPI",
+          "Docker",
+          "PostgreSQL",
+          "Kafka"
+        ],
+        "highlights": [
+          "Architected low-latency microservices handling 25,000+ RPS with 99.99% uptime SLA.",
+          "Led development of real-time search indexing pipeline reducing query latencies by 45%."
+        ]
+      }
+    ],
+    "projects": [
+      {
+        "title": "Open Source LLM Orchestrator",
+        "category": "GenAI / Systems",
+        "technologies": [
+          "Python",
+          "PyTorch",
+          "FastAPI"
+        ],
+        "url": "https://github.com/janedoe/llm-orchestrator",
+        "description": "High-throughput model serving platform with automatic token-bucket rate limiting and fallback cascades."
+      }
+    ],
+    "core_skills": [
+      "Python",
+      "TypeScript",
+      "FastAPI",
+      "Docker",
+      "Kubernetes",
+      "PostgreSQL",
+      "Redis",
+      "Kafka",
+      "CI/CD",
+      "Distributed Systems"
+    ],
+    "skill_categories": {
+      "Languages": [
+        "Python",
+        "TypeScript",
+        "SQL"
+      ],
+      "Backend & AI": [
+        "FastAPI",
+        "PyTorch",
+        "Distributed Systems"
+      ],
+      "DevOps & Data": [
+        "Docker",
+        "Kubernetes",
+        "PostgreSQL",
+        "Redis",
+        "Kafka"
+      ]
+    }
+  },
+  "search_preferences": {
+    "target_roles": [
+      "Applied AI Intern",
+      "Cyber Security Intern"
+    ],
+    "target_locations": [
+      "London, UK",
+      "Remote"
+    ],
+    "timeframe": "1w",
+    "seniority": [
+      "Intern"
+    ],
+    "platforms": [
+      "Ashby",
+      "Greenhouse",
+      "Lever",
+      "LinkedIn",
+      "Indeed"
+    ],
+    "skip_portals": [
+      "targetjobs"
+    ],
+    "min_ats_score_threshold": 70,
+    "topics": [
+      "applied AI",
+      "cyber security"
+    ],
+    "level": "intern"
+  },
+  "networking_and_references": {
+    "reference_personas": [
+      {
+        "tier": "Tier 1 - Primary Verification",
+        "persona": "Engineering Director / VP of Engineering",
+        "context": "Direct supervision of core distributed systems architecture and system reliability."
+      }
+    ],
+    "referral_targets": [
+      {
+        "group": "Alumni & Professional Network",
+        "targets": [
+          "Senior Engineering Leads",
+          "Technical Recruiters"
+        ],
+        "focus": "Direct outreach highlighting distributed systems scale and reliability engineering."
+      }
+    ]
+  },
+  "_README": "Copy of this file is candidate_profile.json (made by setup.sh). Replace EVERY value with your own. topics + level are the defaults for a bare `./jf scan`. Never commit candidate_profile.json: it holds personal details."
+}

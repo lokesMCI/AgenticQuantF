@@ -1,0 +1,240 @@
+import os
+import sys
+import shutil
+import asyncio
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# Ensure backend root is always on sys.path across all invocation environments
+_backend_root = os.path.dirname(os.path.abspath(__file__))
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+
+# Load environment variables
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, FileResponse
+
+from services.session_store import (
+    BASE_DIR,
+    UPLOAD_DIR,
+    OUTPUT_DIR,
+    USER_DATA_DIR,
+    get_session_data,
+    set_session_data,
+    LLMClientLogQueue,
+    _get_user_storage_dirs,
+    _user_output_paths,
+    _safe_key
+)
+from services.cron_scheduler import background_cron_worker
+from routes.auth_routes import router as auth_router
+from routes.resume_routes import router as resume_router
+from routes.job_routes import router as job_router, _extract_company_from_jd
+from routes.ai_routes import router as ai_router
+from routes.admin_routes import router as admin_router
+from routes.mcp_routes import router as mcp_router
+from routes.oauth_routes import router as oauth_router
+from utils.latex_utils import compile_and_check_page_metrics, apply_latex_hotfix, generate_latex_from_json
+from services.overleaf import upload_zip_to_tmpfiles
+
+
+def _sync_fallback_resume_cls():
+    """Ensure baseline resume.cls is synced to uploads and assets."""
+    assets_cls = os.path.join(BASE_DIR, "assets", "resume.cls")
+    uploads_cls = os.path.join(UPLOAD_DIR, "resume.cls")
+    if os.path.exists(assets_cls) and not os.path.exists(uploads_cls):
+        try:
+            shutil.copy2(assets_cls, uploads_cls)
+            print(f"Synced fallback resume.cls from {assets_cls} to {uploads_cls}")
+        except Exception as e:
+            print(f"Warning: Failed to sync resume.cls to uploads: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Ensure directory structure and baseline assets
+    _sync_fallback_resume_cls()
+
+    # Automatically audit & migrate existing legacy files on persistent volumes (Hugging Face / local) to AES-256-GCM
+    try:
+        from services.storage_encryption import migrate_storage_directory_to_encrypted
+        # In HF Spaces persistent volume is mounted at STORAGE_ROOT (/data or BASE_DIR)
+        for target_dir in [USER_DATA_DIR, os.path.join(BASE_DIR, "user_data"), UPLOAD_DIR, OUTPUT_DIR]:
+            if os.path.exists(target_dir):
+                await asyncio.to_thread(migrate_storage_directory_to_encrypted, target_dir)
+    except Exception as enc_mig_err:
+        print(f"Storage encryption auto-migration notice: {enc_mig_err}")
+
+    # Ensure UK sponsor database is initialized/synced in background without blocking startup
+    async def _auto_sync_sponsors():
+        try:
+            from services.uk_sponsor_service import sync_uk_sponsors
+            # Run in worker thread to prevent blocking event loop
+            await asyncio.to_thread(sync_uk_sponsors, force=False)
+        except Exception as e:
+            print(f"Background sponsor sync skipped: {e}")
+
+    asyncio.create_task(_auto_sync_sponsors())
+
+    # Launch Playwright browser instance if available
+    browser = None
+    playwright = None
+    if os.getenv("DISABLE_STARTUP_BROWSER") not in ("1", "true", "True"):
+        try:
+            from playwright.async_api import async_playwright
+            playwright = await async_playwright().start()
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+            try:
+                browser = await playwright.chromium.launch(
+                    headless=True,
+                    args=launch_args
+                )
+            except Exception:
+                try:
+                    browser = await playwright.chromium.launch(
+                        channel="chrome",
+                        headless=True,
+                        args=launch_args
+                    )
+                except Exception:
+                    browser = None
+
+            if browser:
+                app.state.browser = browser
+                app.state.playwright = playwright
+                print("Headless browser pool initialized successfully.")
+            else:
+                app.state.browser = None
+                app.state.playwright = None
+                if playwright:
+                    try:
+                        await playwright.stop()
+                    except Exception:
+                        pass
+                    playwright = None
+                print("Playwright browser pool skipped (using high-speed direct API discovery).")
+        except Exception as e:
+            print(f"Playwright background pool skipped: {e}")
+            app.state.browser = None
+            app.state.playwright = None
+
+    # Start background cron worker
+    cron_task = asyncio.create_task(background_cron_worker())
+
+    yield
+
+    # Shutdown
+    cron_task.cancel()
+    if browser:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+    if playwright:
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FastAPI Application & Router Mounts
+# ─────────────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Job Finder & ATS Tailor API",
+    description="Full-stack automated Job Discovery, ATS Match Scoring, Resume Tailoring, and AI Auto-Apply Backend",
+    version="3.1.0",
+    lifespan=lifespan
+)
+
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Register Domain-Specific Routers
+app.include_router(auth_router)
+app.include_router(resume_router)
+app.include_router(job_router)
+app.include_router(ai_router)
+app.include_router(admin_router)
+app.include_router(mcp_router)
+app.include_router(oauth_router)
+
+# Mount Static Asset Directories
+if os.path.exists(OUTPUT_DIR):
+    app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
+
+if os.path.exists(os.path.join(BASE_DIR, "assets")):
+    app.mount("/backend_assets", StaticFiles(directory=os.path.join(BASE_DIR, "assets")), name="backend_assets")
+
+# Mount Frontend Build & SPA Catch-All Route
+_this_backend = os.path.dirname(os.path.abspath(__file__))
+frontend_candidates = [
+    os.path.abspath(os.path.join(BASE_DIR, "frontend/dist")),
+    os.path.abspath(os.path.join(BASE_DIR, "../frontend/dist")),
+    os.path.join(_this_backend, "static_frontend"),
+    "/app/frontend/dist",
+]
+frontend_dist = next((p for p in frontend_candidates if os.path.exists(os.path.join(p, "index.html"))), None)
+
+
+if frontend_dist and os.path.exists(frontend_dist):
+    assets_dir = os.path.join(frontend_dist, "assets")
+
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.api_route("/{rest_of_path:path}", methods=["GET", "HEAD"], response_class=HTMLResponse, include_in_schema=False)
+    async def serve_spa_frontend(rest_of_path: str):
+        # 1. Block directory traversal and sensitive environment / key scanners
+        forbidden_substrings = ("..", ".env", ".aws", ".git", ".ssh", "passwd", "environ", "actuator", "graphql", "config.json", "credentials", "phpinfo", "swagger", "meta-data", "secrets.toml")
+        if any(bad in rest_of_path.lower() for bad in forbidden_substrings):
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        # 2. Block direct access to internal api routes if not handled by routers
+        dist_path = frontend_dist or ""
+        if rest_of_path and not rest_of_path.startswith("api") and dist_path:
+            try:
+                # Resolve canonical safe path within frontend_dist
+                target = os.path.abspath(os.path.join(dist_path, rest_of_path))
+                if target.startswith(dist_path) and os.path.exists(target) and os.path.isfile(target):
+                    return FileResponse(target)
+            except Exception:
+                pass
+
+        index_file = os.path.join(dist_path, "index.html") if dist_path else ""
+        if index_file and os.path.exists(index_file):
+            return FileResponse(index_file)
+        return HTMLResponse("<h1>Job Finder Backend is Running </h1><p>Frontend assets not found.</p>", status_code=200)
+
+
+
+def start_server():
+    """Entrypoint for job-finder-server console script."""
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "0.0.0.0")
+    uvicorn.run("backend.main:app", host=host, port=port, reload=False)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    # Disable reload in production to prevent address already in use errors
+    reload_enabled = os.getenv("ENVIRONMENT", "").lower() == "development"
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=reload_enabled)
+

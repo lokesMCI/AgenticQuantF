@@ -1,0 +1,321 @@
+import os
+import json
+import asyncio
+import urllib.parse
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+# pyrefly: ignore [missing-import]
+from services.auth import supabase_request, _is_local_deployment
+# pyrefly: ignore [missing-import]
+from services.email_service import async_send_notification_email
+
+# India Standard Time (IST = UTC + 5:30)
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
+
+
+async def process_and_send_user_digest(user: dict, bypass_time_check: bool = False) -> bool:
+    """Generate and send real matching job digest for a given subscribed user."""
+    email = user.get("email")
+    user_id = user.get("id")
+    if not email:
+        return False
+
+    candidate_name = "Candidate"
+    rdata = {}
+    try:
+        resume_str = user.get("resume_data")
+        if resume_str:
+            rdata = json.loads(resume_str) if isinstance(resume_str, str) else resume_str
+            candidate_name = rdata.get("name", "").strip() or "Candidate"
+    except Exception:
+        pass
+
+    # If resume data is missing from user record, check user_resumes table
+    if not rdata and user_id and not str(user_id).startswith("guest_"):
+        try:
+            res_rows = supabase_request(f"user_resumes?user_id=eq.{user_id}", "GET")
+            if res_rows and res_rows[0].get("resume_data"):
+                raw_rd = res_rows[0]["resume_data"]
+                rdata = json.loads(raw_rd) if isinstance(raw_rd, str) else raw_rd
+                if rdata.get("name"):
+                    candidate_name = rdata.get("name").strip()
+        except Exception:
+            pass
+
+    backend_url = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+    unsub_url = f"{backend_url}/email_action/unsubscribe?email={urllib.parse.quote(email)}"
+
+    # Search preferences configured by user
+    cron_role = user.get("cron_role") or ""
+    cron_location = user.get("cron_location") or "Remote"
+
+    # Resolve excluded portals (default: 'targetjobs' skipped unless explicitly opted in)
+    excluded_portals = []
+    user_sp = user.get("skip_portals") if "skip_portals" in user else user.get("exclude_portals")
+    if user_sp is not None:
+        if isinstance(user_sp, str):
+            excluded_portals.extend([p.strip().lower() for p in user_sp.split(",") if p.strip()])
+        elif isinstance(user_sp, list):
+            excluded_portals.extend([str(p).strip().lower() for p in user_sp if str(p).strip()])
+    else:
+        # Fallback to candidate profile or default targetjobs exclusion
+        excluded_portals = ["targetjobs"]
+        try:
+            from job_finder_mcp.tools.profile_tools import load_profile_data
+            prof = load_profile_data() or {}
+            p_prefs = prof.get("search_preferences", {})
+            if "skip_portals" in p_prefs or "exclude_portals" in p_prefs:
+                p_skip = p_prefs.get("skip_portals") if "skip_portals" in p_prefs else p_prefs.get("exclude_portals")
+                if isinstance(p_skip, list):
+                    excluded_portals = [str(p).strip().lower() for p in p_skip if str(p).strip()]
+                elif isinstance(p_skip, str):
+                    excluded_portals = [p.strip().lower() for p in p_skip.split(",") if p.strip()]
+        except Exception:
+            pass
+
+    env_skip = os.getenv("SKIP_PORTALS") or os.getenv("EXCLUDE_PORTALS")
+    if env_skip:
+        excluded_portals.extend([p.strip().lower() for p in env_skip.split(",") if p.strip()])
+
+    excluded_portals = list(dict.fromkeys(excluded_portals))
+
+    # Fetch real matching jobs dynamically
+    matching_jobs = []
+    try:
+        # pyrefly: ignore [missing-import]
+        from services.job_searcher import find_matching_jobs
+        async for chunk in find_matching_jobs(
+            resume_data=rdata,
+            location=cron_location,
+            keywords=cron_role or None,
+            timeframe="24h",
+            exclude_portals=excluded_portals if excluded_portals else None
+        ):
+            try:
+                parsed = json.loads(chunk.strip())
+                if parsed.get("type") == "result" and parsed.get("jobs"):
+                    matching_jobs = parsed["jobs"]
+            except Exception:
+                pass
+    except Exception as search_err:
+        print(f"[Daily Mailer] Job search error for {email}: {search_err}")
+
+    # Fallback to 48h search if 24h returned no fresh postings
+    if not matching_jobs:
+        try:
+            # pyrefly: ignore [missing-import]
+            from services.job_searcher import find_matching_jobs
+            async for chunk in find_matching_jobs(
+                resume_data=rdata,
+                location=cron_location,
+                keywords=cron_role or None,
+                timeframe="48h",
+                exclude_portals=excluded_portals if excluded_portals else None
+            ):
+                try:
+                    parsed = json.loads(chunk.strip())
+                    if parsed.get("type") == "result" and parsed.get("jobs"):
+                        matching_jobs = parsed["jobs"]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Build dynamic cards and text digest (cap TargetJobs to max 7 so LinkedIn and Direct ATS have high visibility)
+    targetjobs_email_count = 0
+    MAX_TARGETJOBS_EMAIL_CAP = 7
+    top_jobs = []
+    if matching_jobs:
+        for j in matching_jobs:
+            plat = str(j.get("platform") or j.get("source") or "").lower()
+            if "targetjobs" in plat:
+                if targetjobs_email_count >= MAX_TARGETJOBS_EMAIL_CAP:
+                    continue
+                targetjobs_email_count += 1
+            top_jobs.append(j)
+            if len(top_jobs) >= 20:
+                break
+
+    text_digest_lines = [f"Hi {candidate_name},\n", "Here are your top daily matching roles:\n"]
+    if top_jobs:
+        for idx, job in enumerate(top_jobs, 1):
+            j_title = job.get("title", "Job Role")
+            j_company = job.get("company", "Company")
+            j_score = job.get("score", 80)
+            j_url = job.get("url", "")
+            t_url = f"{backend_url}/email_action/tailor?job_url={urllib.parse.quote(j_url)}&email={urllib.parse.quote(email)}&title={urllib.parse.quote(j_title)}&company={urllib.parse.quote(j_company)}"
+            text_digest_lines.append(f"{idx}. {j_title} @ {j_company} (Match Score: {j_score}%)\n   View: {j_url}\n   Auto-Tailor: {t_url}\n")
+    else:
+        text_digest_lines.append("No new high-match postings found in the last 24 hours. We will keep scanning for you.\n")
+
+    text_digest_lines.append(f"\nManage subscription / unsubscribe: {unsub_url}\n")
+    text_digest = "\n".join(text_digest_lines)
+
+    # Build Rich HTML Digest
+    cards_html = ""
+    if top_jobs:
+        for job in top_jobs:
+            platform = str(job.get("platform", "")).strip()
+            job_url = job.get("url", "")
+            is_reed = "reed" in platform.lower()
+            is_linkedin = "linkedin" in platform.lower()
+            is_indeed = "indeed" in platform.lower()
+            platform_name = "Reed" if is_reed else "LinkedIn" if is_linkedin else "Indeed" if is_indeed else (platform or "Direct ATS")
+            platform_color = "#EC4899" if is_reed else "#0A66C2" if is_linkedin else "#2164F3" if is_indeed else "#10B981"
+            platform_bg = "#EC489915" if is_reed else "#0A66C215" if is_linkedin else "#2164F315" if is_indeed else "#10B98115"
+            tailor_url = f"{backend_url}/email_action/tailor?job_url={urllib.parse.quote(job_url)}&email={urllib.parse.quote(email)}&title={urllib.parse.quote(str(job.get('title', '')))}&company={urllib.parse.quote(str(job.get('company', '')))}"
+
+            recruiter_info = job.get("recruiter") or {}
+            rec_name = recruiter_info.get("name") if isinstance(recruiter_info, dict) else None
+            rec_profile = recruiter_info.get("profile_url") if isinstance(recruiter_info, dict) else None
+
+            recruiter_html = ""
+            if rec_name:
+                if rec_profile:
+                    recruiter_html = f'<p style="margin: 4px 0 0 0; color: #475569; font-size: 0.84rem;">Recruiter: <a href="{rec_profile}" target="_blank" style="color: #0284C7; text-decoration: none; font-weight: 600;">{rec_name}</a></p>'
+                else:
+                    recruiter_html = f'<p style="margin: 4px 0 0 0; color: #475569; font-size: 0.84rem;">Recruiter: <span style="font-weight: 600;">{rec_name}</span></p>'
+
+            cards_html += f"""
+            <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 18px; margin-bottom: 12px; box-sizing: border-box;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr>
+                        <td>
+                            <h3 style="margin: 0 0 4px 0; color: #1E293B; font-size: 1.05rem; font-weight: 700;">{job.get('title', 'Job Listing')}</h3>
+                            <p style="margin: 0; color: #64748B; font-size: 0.88rem; font-weight: 500;">
+                                {job.get('company', 'Company')} &bull; <span style="color: {platform_color}; font-weight: 700; background-color: {platform_bg}; padding: 2px 6px; border-radius: 4px;">{platform_name}</span>
+                            </p>
+                            {recruiter_html}
+                        </td>
+                        <td style="text-align: right; vertical-align: top; width: 110px;">
+                            <span style="display: inline-block; background-color: #10B98115; color: #10B981; padding: 4px 8px; border-radius: 6px; font-size: 0.78rem; font-weight: 700; white-space: nowrap;">{job.get('score', 80)}% match (Exact ATS)</span>
+                        </td>
+                    </tr>
+                </table>
+                <table style="width: 100%; border-collapse: collapse; margin-top: 14px;">
+                    <tr>
+                        <td style="width: 50%; padding-right: 5px;">
+                            <a href="{job_url}" target="_blank" style="display: block; text-align: center; padding: 9px 12px; font-size: 0.82rem; color: #64748B; background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; text-decoration: none; font-weight: 600;">View Listing</a>
+                        </td>
+                        <td style="width: 50%; padding-left: 5px;">
+                            <a href="{tailor_url}" target="_blank" style="display: block; text-align: center; padding: 9px 12px; font-size: 0.82rem; color: #FFFFFF; background-color: #0284C7; border-radius: 6px; text-decoration: none; font-weight: bold;">Auto-Tailor</a>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+            """
+    else:
+        cards_html = """
+        <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 24px; text-align: center; color: #64748B;">
+            <p style="margin: 0; font-size: 0.95rem;">No new postings found matching your exact profile in the last 24h. We will keep scanning daily for you.</p>
+        </div>
+        """
+
+    html_digest = f"""
+    <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 25px; border: 1px solid #E2E8F0; border-radius: 16px; background-color: #FAFAFA; box-shadow: 0 4px 20px rgba(0,0,0,0.03);">
+        <div style="text-align: center; margin-bottom: 24px;">
+            <span style="font-size: 3rem;"></span>
+            <h2 style="color: #0284C7; margin: 10px 0 5px; font-weight: 800; font-size: 1.5rem;">Daily Job Matches Digest</h2>
+            <p style="color: #334155; font-size: 0.98rem; font-weight: 600; margin: 8px 0 4px;">Hi {candidate_name},</p>
+            <p style="color: #64748B; font-size: 0.9rem; margin: 0;">Here are your top matching roles from the past 24 hours ({cron_location}):</p>
+        </div>
+        {cards_html}
+        <hr style="border: 0; border-top: 1px solid #E2E8F0; margin: 30px 0 20px;" />
+        <p style="font-size: 0.8rem; color: #94A3B8; text-align: center; margin: 0;">
+            <a href="{unsub_url}" target="_blank" style="color: #0284C7;">Unsubscribe</a> or manage preferences in your dashboard.
+        </p>
+    </div>
+    """
+
+    target_email = (os.getenv("NOTIFY_EMAIL") or email) if _is_local_deployment() else email
+    sent = await async_send_notification_email(
+        to_email=target_email,
+        subject=f"Daily Job Matches Digest: {len(top_jobs)} new roles found" if top_jobs else "Daily Job Matches Digest",
+        text_body=text_digest,
+        html_body=html_digest,
+        sender_name="AI Job Finder"
+    )
+
+    if sent and user_id and not str(user_id).startswith("guest_"):
+        today_str = datetime.now(IST_TZ).strftime("%Y-%m-%d")
+        try:
+            supabase_request(f"users?id=eq.{user_id}", "PATCH", {"cron_last_sent_date": today_str})
+        except Exception:
+            pass
+
+    return sent
+
+
+async def background_cron_worker():
+    """Background loop that executes scheduled email digests, daily ATS board slug harvesting, and daily UK visa sponsor updates."""
+    print("⏰ [Daily Mailer] Background cron worker started.")
+    last_harvest_date: Optional[str] = None
+    last_sponsor_sync_date: Optional[str] = None
+
+    while True:
+        try:
+            now_ist = datetime.now(IST_TZ)
+            today_str = now_ist.strftime("%Y-%m-%d")
+
+            # 1. Daily ATS Company Slug Harvesting & Live Validation (runs once every 24 hours at 03:00 UTC / 08:30 IST)
+            if last_harvest_date != today_str:
+                try:
+                    try:
+                        from services.company_slug_harvester import harvest_all_company_slugs
+                        from services.company_slug_registry import validate_all_unverified_slugs, get_active_slugs
+                    except ImportError:
+                        from backend.services.company_slug_harvester import harvest_all_company_slugs
+                        from backend.services.company_slug_registry import validate_all_unverified_slugs, get_active_slugs
+
+                    print("[Daily Cron] Running scheduled 24-hour ATS company board harvest & validation...")
+                    await harvest_all_company_slugs(sources=["seeds"])
+                    await validate_all_unverified_slugs(limit=100)
+                    active_map = get_active_slugs()
+                    total_act = sum(len(v) for v in active_map.values())
+                    print(f"[Daily Cron] ATS registry refreshed: {total_act} active verified company boards.")
+                    last_harvest_date = today_str
+                except Exception as harvest_err:
+                    print(f"[Daily Cron] Note: Slug harvest routine exception: {harvest_err}")
+
+            # 2. Daily UK Visa Sponsor Registry Sync (runs once per day, persists directly into /data/uk_sponsors.db)
+            if last_sponsor_sync_date != today_str:
+                try:
+                    try:
+                        from services.uk_sponsor_service import sync_uk_sponsors
+                    except ImportError:
+                        from backend.services.uk_sponsor_service import sync_uk_sponsors
+
+                    print("[Daily Cron] Checking and syncing official UK Home Office visa sponsor register...")
+                    res = await asyncio.to_thread(sync_uk_sponsors, force=False)
+                    print(f"[Daily Cron] UK Visa Sponsor sync complete: status={res.get('status')} total={res.get('total_sponsors', 0)}")
+                    last_sponsor_sync_date = today_str
+                except Exception as sponsor_err:
+                    print(f"[Daily Cron] Note: UK sponsor sync exception: {sponsor_err}")
+
+            # 2. Scheduled Job Digest Notifications for Subscribed Users
+            res = supabase_request("users?cron_enabled=eq.true", "GET")
+            if res and isinstance(res, list):
+                for user in res:
+                    try:
+                        # Check last sent date to avoid multiple sends per day
+                        if user.get("cron_last_sent_date") == today_str:
+                            continue
+
+                        # Check scheduled time (defaults to 09:00 IST if unspecified)
+                        user_cron_time = (user.get("cron_time") or "09:00").strip()
+                        user_hh = int(user_cron_time.split(":")[0]) if ":" in user_cron_time else 9
+                        user_mm = int(user_cron_time.split(":")[1]) if ":" in user_cron_time else 0
+                        user_sched_dt = now_ist.replace(hour=user_hh, minute=user_mm, second=0, microsecond=0)
+
+                        # Trigger if current time is past or at scheduled time
+                        if now_ist >= user_sched_dt:
+                            print(f"[Daily Mailer] Triggering scheduled digest for {user.get('email')} (scheduled: {user_cron_time} IST)")
+                            await process_and_send_user_digest(user, bypass_time_check=False)
+                    except Exception as u_err:
+                        print(f"[Daily Mailer] Error processing user {user.get('id')}: {u_err}")
+        except Exception as e:
+            # Supabase not connected or offline
+            pass
+
+        # Check every 60 seconds
+        await asyncio.sleep(60)

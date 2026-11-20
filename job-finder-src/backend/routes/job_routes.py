@@ -1,0 +1,797 @@
+import os
+import json
+import time
+import uuid
+import asyncio
+import threading
+import traceback
+from typing import Optional, List, Dict
+from fastapi import APIRouter, HTTPException, Header, Request, BackgroundTasks
+from fastapi.responses import StreamingResponse, FileResponse, Response
+from pydantic import BaseModel, Field
+import zipfile
+import io
+
+from services.session_store import get_session_data, _user_output_paths
+from services.auth import async_get_user_by_token
+from services.scraper import scrape_job_description
+from services.job_searcher import find_matching_jobs
+from services.autofill_agent import autofill_job_application
+from services.application_tracker import list_applications, update_application_status, record_application
+from utils.ttl_cache import TTLCache
+
+router = APIRouter(tags=["Jobs & Applications"])
+
+# Rate limit tracking
+_rate_limits: Dict[str, list] = {}
+_rate_limit_lock = threading.Lock()
+
+# Job search TTL cache (5 min)
+_job_search_cache = TTLCache(ttl_seconds=300, max_size=500)
+
+# Background task registry for /apply sessions
+_task_registry: Dict[str, dict] = {}
+_background_tasks: Dict[str, asyncio.Task] = {}
+_registry_lock = threading.Lock()
+
+
+def _check_rate_limit(request: Request, endpoint: str, max_requests: int = 60, window_seconds: int = 60, token: Optional[str] = None):
+    client_ip = request.client.host if request.client else "unknown"
+    if client_ip in ("127.0.0.1", "localhost", "::1"):
+        return  # Exclude local client / Chrome extension calls from restrictive rate limits
+    key = f"{endpoint}:{token or client_ip}"
+    now = time.time()
+    with _rate_limit_lock:
+        timestamps = _rate_limits.get(key, [])
+        timestamps = [t for t in timestamps if now - t < window_seconds]
+        if len(timestamps) >= max_requests:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded for {endpoint}. Try again in a few moments."
+            )
+        timestamps.append(now)
+        _rate_limits[key] = timestamps
+
+
+def update_task_status(task_id: str, status: str, message: str):
+    with _registry_lock:
+        _task_registry[task_id] = {
+            "status": status,
+            "message": message,
+            "timestamp": time.time()
+        }
+
+
+@router.get("/extension_version_hash")
+def get_extension_version_hash():
+    import hashlib
+    from config.constants import APP_VERSION
+    ext_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "extension"))
+    h = hashlib.md5()
+    version = APP_VERSION
+    manifest_path = os.path.join(ext_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                mdata = json.load(mf)
+                version = mdata.get("version", version)
+        except Exception:
+            pass
+
+    if os.path.exists(ext_dir):
+        for root, _, files in sorted(os.walk(ext_dir)):
+            for f in sorted(files):
+                if not f.startswith(".") and not f.endswith((".pyc", ".swp", "~")):
+                    fp = os.path.join(root, f)
+                    try:
+                        h.update(f"{f}:{os.path.getmtime(fp)}".encode())
+                    except OSError:
+                        pass
+    return {"hash": h.hexdigest(), "version": version, "download_url": "/download_extension_zip"}
+ 
+ 
+@router.get("/download_extension_zip")
+def download_extension_zip():
+    ext_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "extension"))
+    if not os.path.exists(ext_dir):
+        raise HTTPException(status_code=404, detail="Extension directory not found")
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for root, _, files in os.walk(ext_dir):
+            for file in files:
+                if not file.startswith(".") and not file.endswith((".pyc", ".swp", "~")):
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, ext_dir)
+                    zip_file.write(file_path, arcname)
+
+    zip_buffer.seek(0)
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": "attachment; filename=job_finder_extension.zip"
+        }
+    )
+
+
+
+def _extract_company_from_jd(jd_text: str, page_url: Optional[str] = None) -> str:
+    import re
+    if page_url:
+        # 1. Direct Open Guest API Extraction for LinkedIn Job Postings
+        if "linkedin.com" in page_url:
+            job_id_match = re.search(r'(?:jobs/view/|currentJobId=|jobPosting/|[-/])(\d{8,12})(?:[/?&#]|$)', page_url)
+            if job_id_match:
+                job_id = job_id_match.group(1)
+                try:
+                    import urllib.request
+                    from bs4 import BeautifulSoup
+                    from utils.ssl_utils import SSL_CONTEXT
+                    api_url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+                    req = urllib.request.Request(
+                        api_url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.5"
+                        }
+                    )
+                    with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=5) as resp:
+                        soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
+                        company_elem = soup.select_one("a.topcard__org-name-link") or soup.select_one(".topcard__flavor") or soup.select_one(".topcard__org-name")
+                        if company_elem:
+                            found_company = company_elem.get_text(strip=True)
+                            if found_company and len(found_company) > 1:
+                                return found_company
+                except Exception:
+                    pass
+
+        cleaned_url = page_url.split("?")[0].rstrip("/")
+        m = re.search(r'https?://(?:www\.)?([^/]+)\.com/([^/]+)', cleaned_url)
+        if m:
+            domain, path_first = m.group(1).lower(), m.group(2).lower()
+            if domain in ["linkedin", "indeed", "glassdoor", "ziprecruiter"]:
+                if path_first not in ["jobs", "view", "job", "rc", "m"]:
+                    return path_first.replace("-", " ").title()
+            elif domain in ["greenhouse", "ashbyhq", "lever", "smartrecruiters", "workday"]:
+                return path_first.replace("-", " ").title()
+            else:
+                return domain.replace("-", " ").title()
+
+    if jd_text:
+        # Pattern 1: "<Company> is a/an ..." at beginning of text or lines (e.g. "Hadean is a deep-tech company...")
+        m1 = re.search(r'(?:^|\n|\.\s+)([A-Z][A-Za-z0-9\s&.,-]{1,30}?)\s+(?:is|are)\s+(?:a|an)\s+', jd_text)
+        if m1:
+            candidate = m1.group(1).strip()
+            if candidate.lower() not in ["the", "this", "our", "a", "an", "there", "it", "here", "what", "who"]:
+                return candidate
+
+        # Pattern 2: "About <Company>", "At <Company>, we...", "Join <Company>"
+        m2 = re.search(r'(?:about|at|join|welcome to)\s+([A-Z][A-Za-z0-9\s&.,-]{2,30}?)(?:\s+(?:is|are|we|team|to|for|where|who|\.|\n|,|!))', jd_text, re.IGNORECASE)
+        if m2:
+            candidate = m2.group(1).strip()
+            if candidate.lower() not in ["the", "this", "our", "a", "an", "us"]:
+                return candidate
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pydantic Schemas
+# ─────────────────────────────────────────────────────────────────────────────
+class ScrapeRequest(BaseModel):
+    url: str
+
+
+class SearchJobsRequest(BaseModel):
+    role: Optional[str] = None                # e.g., "AI Engineer", "Product Engineer", "Full-Stack"
+    location: Optional[str] = "London"
+    timeframe: Optional[str] = "48h"          # "24h", "48h", "7d"
+    keywords: Optional[str] = None
+    target_platforms: Optional[List[str]] = ["ashby", "greenhouse", "lever", "linkedin", "workday"]
+    exclude_portals: Optional[List[str]] = None
+    skip_portals: Optional[List[str]] = None
+
+
+class ExtensionParseJobRequest(BaseModel):
+    page_text: Optional[str] = None
+    page_url: Optional[str] = None
+    page_title: Optional[str] = None
+
+
+class ScanPortalsRequest(BaseModel):
+    keywords: Optional[List[str]] = None
+    min_ats_score: Optional[int] = 70
+
+
+class ApplyRequest(BaseModel):
+    job_url: str
+    job_title: Optional[str] = None
+    company: Optional[str] = None
+    direct_mode: Optional[bool] = False
+
+
+class UpdateStatusRequest(BaseModel):
+    job_url: str
+    status: str
+    job_title: Optional[str] = None
+    company: Optional[str] = None
+    score: Optional[int] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job Discovery & Scraping Routes
+# ─────────────────────────────────────────────────────────────────────────────
+@router.post("/scrape_job")
+async def scrape_job(request: ScrapeRequest, http_request: Request):
+    _check_rate_limit(http_request, "scrape_job", max_requests=10, window_seconds=60)
+    try:
+        scraped = await scrape_job_description(request.url)
+        return {
+            "status": "success",
+            "title": scraped.get("title", ""),
+            "description": scraped.get("description", ""),
+            "company": scraped.get("company", "") or _extract_company_from_jd(scraped.get("description", ""), request.url)
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/search_matching_jobs")
+async def search_matching_jobs(request: SearchJobsRequest, http_request: Request, authorization: Optional[str] = Header(None), x_gemini_api_key: Optional[str] = Header(None)):
+    _check_rate_limit(http_request, "search_matching_jobs", max_requests=5, window_seconds=300)
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+
+    session = get_session_data(token)
+    session_resume_data = session.get("data")
+    if not session_resume_data:
+        raise HTTPException(status_code=400, detail="Please upload a resume first.")
+
+    db_api_key = None
+    user = None
+    if token:
+        user = await async_get_user_by_token(token)
+        if user:
+            db_api_key = user.get("gemini_api_key")
+    active_api_key = x_gemini_api_key or db_api_key
+
+    effective_keywords = (request.keywords or request.role or "").strip() or None
+    effective_location = request.location or "Remote"
+    effective_timeframe = request.timeframe or "48h"
+
+    # Resolve excluded portals (default: 'targetjobs' skipped unless explicitly included)
+    effective_exclude = []
+    req_exclude = request.exclude_portals or request.skip_portals
+    if req_exclude is not None:
+        effective_exclude = [p.strip().lower() for p in req_exclude if p.strip()]
+    else:
+        effective_exclude = ["targetjobs"]
+        if user and user.get("skip_portals") is not None:
+            user_skip = user.get("skip_portals")
+            if isinstance(user_skip, list):
+                effective_exclude = [str(p).strip().lower() for p in user_skip if str(p).strip()]
+            elif isinstance(user_skip, str):
+                effective_exclude = [p.strip().lower() for p in user_skip.split(",") if p.strip()]
+        elif not user:
+            try:
+                from job_finder_mcp.tools.profile_tools import load_profile_data
+                prof = load_profile_data() or {}
+                p_prefs = prof.get("search_preferences", {})
+                if "skip_portals" in p_prefs or "exclude_portals" in p_prefs:
+                    p_skip = p_prefs.get("skip_portals") if "skip_portals" in p_prefs else p_prefs.get("exclude_portals")
+                    if isinstance(p_skip, list):
+                        effective_exclude = [str(p).strip().lower() for p in p_skip if str(p).strip()]
+                    elif isinstance(p_skip, str):
+                        effective_exclude = [p.strip().lower() for p in p_skip.split(",") if p.strip()]
+            except Exception:
+                pass
+
+    env_skip = os.getenv("SKIP_PORTALS") or os.getenv("EXCLUDE_PORTALS")
+    if env_skip:
+        effective_exclude.extend([p.strip().lower() for p in env_skip.split(",") if p.strip()])
+    effective_exclude = list(dict.fromkeys(effective_exclude))
+
+    target_plats = [p.strip().lower() for p in (request.target_platforms or []) if p.strip()]
+    cache_key = (effective_keywords, effective_location, effective_timeframe, tuple(sorted(effective_exclude)), tuple(sorted(target_plats)))
+    cached_jobs = _job_search_cache.get(cache_key)
+    if cached_jobs is not None:
+        async def cached_job_stream():
+            yield json.dumps({"type": "log", "message": "Loaded job results from cache (< 5 min old)!"}) + "\n"
+            for job in cached_jobs:
+                yield json.dumps({"type": "partial_result", "job": job}) + "\n"
+            yield json.dumps({"type": "result", "jobs": cached_jobs}) + "\n"
+        return StreamingResponse(
+            cached_job_stream(),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    try:
+        async def caching_job_stream():
+            q: asyncio.Queue = asyncio.Queue()
+            all_jobs = []
+            search_done = False
+
+            async def _producer():
+                nonlocal all_jobs, search_done
+                try:
+                    async for chunk in find_matching_jobs(
+                        resume_data=session_resume_data,
+                        location=effective_location,
+                        keywords=effective_keywords,
+                        timeframe=effective_timeframe,
+                        custom_api_key=active_api_key,
+                        browser=getattr(http_request.app.state, "browser", None),
+                        exclude_portals=effective_exclude if effective_exclude else None,
+                        target_platforms=request.target_platforms
+                    ):
+                        try:
+                            parsed = json.loads(chunk.strip())
+                            if parsed.get("type") == "result" and parsed.get("jobs"):
+                                all_jobs = parsed["jobs"]
+                                _job_search_cache.set(cache_key, all_jobs)
+                        except Exception:
+                            pass
+                        await q.put(chunk)
+                except Exception as pe:
+                    traceback.print_exc()
+                    await q.put(json.dumps({"type": "log", "message": f"Search error: {pe}"}) + "\n")
+                finally:
+                    search_done = True
+                    await q.put(None)
+
+            async def _keepalive():
+                # Emit immediate ping on connection start & heartbeat every 3 seconds
+                await q.put("{\"type\":\"ping\"}" + " " * 2048 + "\n")
+                while not search_done:
+                    await asyncio.sleep(3)
+                    if not search_done:
+                        await q.put("{\"type\":\"ping\"}" + " " * 2048 + "\n")
+
+            producer_task = asyncio.create_task(_producer())
+            keepalive_task = asyncio.create_task(_keepalive())
+
+            try:
+                while True:
+                    chunk = await q.get()
+                    if chunk is None:
+                        break
+                    yield chunk
+            finally:
+                producer_task.cancel()
+                keepalive_task.cancel()
+
+        return StreamingResponse(
+            caching_job_stream(),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/extension/parse_job_details")
+async def parse_job_details_endpoint(request: ExtensionParseJobRequest):
+    """Extract exact Company, Job Title & full JD for Chrome Extension popup."""
+    title: str = request.page_title or ""
+    company: str = ""
+    description: str = request.page_text or ""
+
+    if not description and request.page_url and ("linkedin.com/jobs" in request.page_url or "indeed.com" in request.page_url):
+        try:
+            scraped = await scrape_job_description(request.page_url)
+            if scraped and scraped.get("description"):
+                scraped_title = scraped.get("title")
+                if scraped_title and scraped_title not in ["LinkedIn Job", "Indeed Job"]:
+                    title = str(scraped_title)
+                if scraped.get("company"):
+                    company = str(scraped.get("company") or "")
+                scraped_desc = scraped.get("description")
+                if scraped_desc and len(str(scraped_desc)) > 100:
+                    description = str(scraped_desc)
+        except Exception as e:
+            print(f"[/extension/parse_job_details] Scraper enrichment error: {e}")
+
+    if not company and request.page_url:
+        company = await asyncio.to_thread(_extract_company_from_jd, description, request.page_url) or ""
+    if not company and description:
+        company = await asyncio.to_thread(_extract_company_from_jd, description, None) or ""
+
+    invalid_titles = {"sign in", "log in", "login", "register", "apply now", "menu", "search", "indeed", "linkedin", "apple"}
+    if not title or title.lower() in invalid_titles or not title.strip():
+        if request.page_url and "indeed.com" in request.page_url:
+            try:
+                scraped = await scrape_job_description(request.page_url)
+                if scraped and scraped.get("title"):
+                    st = str(scraped.get("title") or "").strip()
+                    if st and st.lower() not in invalid_titles:
+                        title = st
+            except Exception:
+                pass
+        if not title or title.lower() in invalid_titles:
+            title = "Target Role"
+
+    return {
+        "job_title": title,
+        "company": company or "Hiring Company",
+        "job_description": description
+    }
+
+
+@router.post("/portals/scan")
+async def scan_portals_endpoint(request: ScanPortalsRequest, authorization: Optional[str] = Header(None)):
+    """Automated ATS Portal Scanner (Greenhouse, Ashby, Lever) for discovery."""
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    session = get_session_data(token)
+    session_resume = session.get("data") or {}
+
+    from services.portal_scanner import PortalScanner
+    scanner = PortalScanner()
+    raw_jobs = await scanner.scan_all_portals(target_keywords=request.keywords)
+
+    if session_resume:
+        scored = scanner.score_portal_jobs_for_candidate(raw_jobs, session_resume, min_score=request.min_ats_score or 70)
+        return {"total_found": len(raw_jobs), "matching_jobs": scored}
+
+    return {"total_found": len(raw_jobs), "matching_jobs": raw_jobs[:20]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Applications & Automation
+# ─────────────────────────────────────────────────────────────────────────────
+@router.get("/applications")
+async def get_applications(authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    return {"applications": await asyncio.to_thread(list_applications, token)}
+
+
+@router.get("/applications/skills_heatmap")
+async def get_skills_heatmap(authorization: Optional[str] = Header(None)):
+    """Computes an interactive ATS keyword gap & skill frequency heatmap across user applications."""
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    apps = await asyncio.to_thread(list_applications, token)
+    
+    from collections import Counter
+    matched_counts = Counter()
+    missing_counts = Counter()
+
+    for app in apps:
+        m_skills = app.get("matched_skills") or []
+        if isinstance(m_skills, str):
+            m_skills = [s.strip() for s in m_skills.split(",") if s.strip()]
+        for s in m_skills:
+            matched_counts[s.lower()] += 1
+
+        miss_skills = app.get("missing_skills") or []
+        if isinstance(miss_skills, str):
+            miss_skills = [s.strip() for s in miss_skills.split(",") if s.strip()]
+        for s in miss_skills:
+            missing_counts[s.lower()] += 1
+
+    return {
+        "total_applications_analyzed": len(apps),
+        "top_matched_skills": [{"skill": k, "count": v} for k, v in matched_counts.most_common(15)],
+        "top_missing_skills": [{"skill": k, "count": v} for k, v in missing_counts.most_common(15)]
+    }
+
+
+@router.post("/update_application_status")
+async def update_status_endpoint(request: UpdateStatusRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    success = await asyncio.to_thread(
+        update_application_status,
+        token,
+        request.job_url,
+        request.status,
+        request.job_title,
+        request.company,
+        request.score
+    )
+    return {"status": "success" if success else "not_found"}
+
+
+@router.post("/apply")
+async def apply(request: ApplyRequest, http_request: Request, authorization: Optional[str] = Header(None), x_gemini_api_key: Optional[str] = Header(None)):
+    _check_rate_limit(http_request, "apply", max_requests=5, window_seconds=300)
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+
+    session = get_session_data(token)
+    session_resume_data = session.get("data")
+    session_resume_path = session.get("path")
+
+    _, pdf_path = _user_output_paths(token)
+    if not os.path.exists(pdf_path):
+        if not session_resume_path or not os.path.exists(session_resume_path):
+            raise HTTPException(status_code=400, detail="No resume available to upload.")
+        pdf_path = session_resume_path
+
+    if not session_resume_data:
+        raise HTTPException(status_code=400, detail="Please upload a resume first or sync your profile from the web app.")
+
+    db_api_key = None
+    if token:
+        user = await async_get_user_by_token(token)
+        if user:
+            db_api_key = user.get("gemini_api_key")
+    active_api_key = x_gemini_api_key or db_api_key
+
+    task_id = str(uuid.uuid4())
+    update_task_status(task_id, "running", "Autofill session initialized...")
+
+    async def run_autofill_wrapper():
+        try:
+            update_task_status(task_id, "running", "Opening automated browser window...")
+            await autofill_job_application(
+                url=request.job_url,
+                resume_data=session_resume_data,
+                resume_pdf_path=os.path.abspath(pdf_path),
+                interactive_mode=not request.direct_mode,
+                user_token=token,
+                custom_api_key=active_api_key
+            )
+            update_task_status(task_id, "completed", "Job application form auto-filled successfully!")
+            try:
+                await asyncio.to_thread(record_application, token, {
+                    "job_title": request.job_title or "",
+                    "company": request.company or "",
+                    "job_url": request.job_url,
+                    "status": "applied" if request.direct_mode else "autofilled",
+                })
+            except Exception as hist_err:
+                print(f"[apply] Failed to record application history: {hist_err}")
+        except Exception as ex:
+            update_task_status(task_id, "failed", f"Autofill error: {str(ex)}")
+        finally:
+            _background_tasks.pop(task_id, None)
+
+    try:
+        task = asyncio.create_task(run_autofill_wrapper())
+        _background_tasks[task_id] = task
+        return {"status": "success", "task_id": task_id, "message": "Autofill session started in separate browser window."}
+    except Exception as e:
+        traceback.print_exc()
+        update_task_status(task_id, "failed", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/apply/status/{task_id}")
+async def apply_status(task_id: str):
+    MAX_STREAM_SECONDS = 1800
+
+    async def status_stream():
+        last_message = ""
+        start = time.time()
+        while True:
+            if time.time() - start > MAX_STREAM_SECONDS:
+                yield json.dumps({"status": "timeout", "message": "Stopped watching after 30 minutes."}) + "\n"
+                break
+
+            with _registry_lock:
+                entry = _task_registry.get(task_id)
+            if not entry:
+                yield json.dumps({"status": "unknown", "message": "Task not found."}) + "\n"
+                break
+
+            if entry["message"] != last_message:
+                yield json.dumps({"status": entry["status"], "message": entry["message"]}) + "\n"
+                last_message = entry["message"]
+
+            if entry["status"] in ["completed", "failed"]:
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        status_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@router.post("/user/cron/trigger_now")
+async def trigger_user_cron_now(authorization: Optional[str] = Header(None)):
+    """Allows a user to trigger an immediate live job digest email to their inbox."""
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    user = await async_get_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=404, detail="User profile not found.")
+
+    from services.cron_scheduler import process_and_send_user_digest
+    success = await process_and_send_user_digest(user, bypass_time_check=True)
+    if success:
+        return {
+            "status": "success",
+            "message": f"Live job digest successfully dispatched to {user.get('email')}!"
+        }
+    else:
+        return {
+            "status": "error",
+            "message": f"Failed to dispatch digest email to {user.get('email')}. Check email service settings."
+        }
+
+
+class FindRecruiterRequest(BaseModel):
+    company: str
+    role: Optional[str] = "Software Engineer"
+    location: Optional[str] = "Remote"
+
+
+@router.post("/jobs/find_recruiter")
+async def find_recruiter_endpoint(
+    req: FindRecruiterRequest,
+    custom_api_key: Optional[str] = Header(None, alias="X-Gemini-API-Key")
+):
+    """Finds verified hiring managers or recruiters for a company and role using Gemini Search Grounding."""
+    from services.recruiter_finder import find_recruiter_for_job
+    if not req.company or not req.company.strip():
+        raise HTTPException(status_code=400, detail="Company name is required.")
+
+    res = find_recruiter_for_job(
+        company=req.company,
+        role=req.role or "Software Engineer",
+        location=req.location or "Remote",
+        custom_api_key=custom_api_key
+    )
+    return res
+
+
+class HarvestSlugsRequest(BaseModel):
+    source: Optional[str] = "seeds"
+    run_validation: Optional[bool] = True
+    legacy_validate: Optional[bool] = Field(default=None, alias="validate")
+    ats: Optional[str] = None
+    limit: Optional[int] = 100
+    background: Optional[bool] = False
+
+
+@router.get("/api/slugs/stats")
+async def get_slug_stats():
+    """Returns total registered and active confirmed company board slugs across Ashby, Greenhouse, and Lever."""
+    try:
+        from services.company_slug_registry import get_active_slugs, get_db_path, init_db
+    except ImportError:
+        from backend.services.company_slug_registry import get_active_slugs, get_db_path, init_db
+    import sqlite3
+
+    path = get_db_path()
+    init_db(path)
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM company_slugs")
+    total_count = cur.fetchone()[0]
+    cur.execute("SELECT ats, COUNT(*) FROM company_slugs WHERE is_active = 1 GROUP BY ats")
+    active_by_ats = {row[0]: row[1] for row in cur.fetchall()}
+    conn.close()
+
+    total_active = sum(active_by_ats.values())
+    return {
+        "total_slugs": total_count,
+        "active_slugs": total_active,
+        "by_platform": {
+            "ashby": active_by_ats.get("ashby", 0),
+            "greenhouse": active_by_ats.get("greenhouse", 0),
+            "lever": active_by_ats.get("lever", 0),
+            "bamboohr": active_by_ats.get("bamboohr", 0),
+            "workday": active_by_ats.get("workday", 0)
+        }
+    }
+
+
+async def _run_async_harvest_and_validate(sources: List[str], should_val: bool, ats_filter: Optional[str], limit: Optional[int]):
+    try:
+        from services.company_slug_harvester import harvest_all_company_slugs
+        from services.company_slug_registry import validate_all_unverified_slugs
+    except ImportError:
+        from backend.services.company_slug_harvester import harvest_all_company_slugs
+        from backend.services.company_slug_registry import validate_all_unverified_slugs
+    await harvest_all_company_slugs(sources=sources)
+    if should_val:
+        await validate_all_unverified_slugs(ats_filter=ats_filter, limit=limit or 100)
+
+
+@router.post("/api/slugs/harvest")
+async def harvest_slugs_endpoint(req: HarvestSlugsRequest, background_tasks: BackgroundTasks):
+    """Triggers asynchronous company board slug harvesting & live validation from seeds/YC/CDX."""
+    try:
+        from services.company_slug_harvester import harvest_all_company_slugs
+        from services.company_slug_registry import validate_all_unverified_slugs, get_active_slugs
+    except ImportError:
+        from backend.services.company_slug_harvester import harvest_all_company_slugs
+        from backend.services.company_slug_registry import validate_all_unverified_slugs, get_active_slugs
+
+    sources = [s.strip().lower() for s in (req.source or "seeds").split(",")]
+    should_val = req.run_validation if req.legacy_validate is None else req.legacy_validate
+
+    if req.background:
+        background_tasks.add_task(_run_async_harvest_and_validate, sources, bool(should_val), req.ats, req.limit)
+        active_map = get_active_slugs(ats=req.ats)
+        return {
+            "status": "queued",
+            "message": "Harvesting and validation task dispatched in background.",
+            "total_active": sum(len(slugs) for slugs in active_map.values()),
+            "by_platform": {ats: len(slugs) for ats, slugs in active_map.items()}
+        }
+
+    harvested = await harvest_all_company_slugs(sources=sources)
+
+    val_res = {"verified": 0, "active": 0}
+    if should_val:
+        val_res = await validate_all_unverified_slugs(ats_filter=req.ats, limit=req.limit or 100)
+
+    active_map = get_active_slugs(ats=req.ats)
+    total_active = sum(len(slugs) for slugs in active_map.values())
+
+    return {
+        "status": "success",
+        "harvested": {ats: len(slugs) for ats, slugs in harvested.items()},
+        "validated": val_res.get("verified", 0),
+        "newly_activated": val_res.get("active", 0),
+        "total_active": total_active,
+        "by_platform": {ats: len(slugs) for ats, slugs in active_map.items()}
+    }
+
+
+# ── UK Visa Sponsor Endpoints ──────────────────────────────────────────────
+@router.get("/api/sponsor/check")
+async def check_sponsor_endpoint(company: str = ""):
+    """Verifies whether a company is registered as a licensed UK visa sponsor."""
+    try:
+        try:
+            from services.uk_sponsor_service import check_uk_sponsor
+        except ImportError:
+            from backend.services.uk_sponsor_service import check_uk_sponsor
+        return check_uk_sponsor(company)
+    except Exception as e:
+        return {
+            "is_sponsor": False,
+            "company_name": company,
+            "matched_name": None,
+            "details": None,
+            "error": str(e)
+        }
+
+
+@router.get("/api/sponsor/stats")
+async def sponsor_stats_endpoint():
+    """Returns total registered UK sponsor count and last synced date."""
+    try:
+        try:
+            from services.uk_sponsor_service import get_sponsor_stats
+        except ImportError:
+            from backend.services.uk_sponsor_service import get_sponsor_stats
+        return get_sponsor_stats()
+    except Exception as e:
+        return {"total_sponsors": 0, "last_sync": "Error", "error": str(e)}
+
+
+@router.post("/api/sponsor/sync")
+async def sync_sponsor_endpoint(background_tasks: BackgroundTasks, force: bool = False):
+    """Triggers an update of the Home Office register CSV into local SQLite/HF."""
+    try:
+        try:
+            from services.uk_sponsor_service import sync_uk_sponsors
+        except ImportError:
+            from backend.services.uk_sponsor_service import sync_uk_sponsors
+        res = sync_uk_sponsors(force=force)
+        return res
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+

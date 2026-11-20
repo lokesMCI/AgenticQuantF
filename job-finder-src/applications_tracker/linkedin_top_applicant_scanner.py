@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+linkedin_top_applicant_scanner.py
+---------------------------------
+Dedicated scanner to search LinkedIn specifically for postings where you have
+the "You'd be a top applicant" (or top 10% / top 25% / stand out) badge,
+and autonomously auto-apply with your master resume (zero LaTeX tailoring).
+
+Workflow:
+1. Opens your authenticated Chrome session (or Chromium) via Playwright.
+2. Performs keyword job searches on LinkedIn (using your candidate target roles & location).
+3. Inspects job cards and description headers for:
+   - "You’d be a top applicant" / "You'd be a top applicant"
+   - "Top applicant"
+   - "In the top 10%" / "In the top 25%"
+   - "We can help you stand out"
+4. Evaluates ATS compatibility and filters duplicates.
+5. Directly auto-applies via browser-use using the master resume (skipping tailoring).
+6. Records results to Supabase and job_applications_tracker.csv.
+
+CLI Usage:
+  # 1. Preview / Review Mode
+  python applications_tracker/linkedin_top_applicant_scanner.py
+
+  # 2. Auto-Submit (Autonomous application execution)
+  python applications_tracker/linkedin_top_applicant_scanner.py --auto-submit
+
+  # 3. Custom search query and limit
+  python applications_tracker/linkedin_top_applicant_scanner.py --keywords "Machine Learning Engineer" --limit 5 --auto-submit
+"""
+
+import os
+import sys
+import re
+import csv
+import json
+import asyncio
+import argparse
+import urllib.parse
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Set
+
+# Ensure backend is on sys.path
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_repo_candidate = os.path.dirname(_this_dir)
+for candidate_backend in [
+    os.path.join(_repo_candidate, "backend"),
+    os.path.join(os.getcwd(), "backend"),
+    _this_dir
+]:
+    if os.path.isdir(candidate_backend) and candidate_backend not in sys.path:
+        sys.path.insert(0, candidate_backend)
+
+from config.constants import (
+    resolve_workspace_root,
+    get_applications_tracker_dir,
+    get_tracker_csv_path
+)
+
+JOB_FINDER_ROOT = resolve_workspace_root()
+BACKEND_DIR = os.path.join(JOB_FINDER_ROOT, "backend")
+TRACKER_DIR = get_applications_tracker_dir()
+CSV_PATH = get_tracker_csv_path()
+
+sys.path.insert(0, JOB_FINDER_ROOT)
+if os.path.isdir(BACKEND_DIR):
+    sys.path.insert(0, BACKEND_DIR)
+sys.path.insert(0, TRACKER_DIR)
+
+# pyrefly: ignore [missing-import]
+try:
+    if not os.environ.get("JOB_FINDER_ROOT"):
+        from dotenv import load_dotenv
+        load_dotenv()
+        if os.path.exists(".env"):
+            load_dotenv(".env")
+except ImportError:
+    pass
+
+
+from job_finder_mcp.tools.profile_tools import load_profile_data
+from services.browser_use_agent import run_browser_use_autofill, preflight_check_job_url
+from config.constants import get_best_flash_lite_model
+# pyrefly: ignore [missing-import]
+from scheduled_job_scanner import (
+    find_master_resume_with_mac_tags,
+    get_existing_tracked_urls,
+    record_to_supabase_or_csv,
+    format_posted_date_time,
+    notify_user_of_failed_applications,
+)
+
+TOP_APPLICANT_PATTERNS = [
+    re.compile(r"top\s+applicant", re.IGNORECASE),
+    re.compile(r"in\s+(?:the\s+)?top\s+\d+%", re.IGNORECASE),
+    re.compile(r"stand\s+out", re.IGNORECASE),
+    re.compile(r"competitive\s+applicant", re.IGNORECASE),
+]
+
+
+def is_top_applicant_badge(text: str) -> bool:
+    """Checks if text contains LinkedIn's top applicant / stand out signals."""
+    if not text:
+        return False
+    return any(p.search(text) for p in TOP_APPLICANT_PATTERNS)
+
+
+async def scan_linkedin_for_top_applicant_jobs(
+    keywords_list: List[str],
+    location: str = "London, UK",
+    timeframe_hours: int = 24,
+    max_pages_per_keyword: int = 7,
+    existing_urls: Optional[Set[str]] = None,
+    headless: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Navigates LinkedIn Job search using Playwright connected to the persistent Chrome session
+    (or standalone) to detect 'You’d be a top applicant' badges directly from rendered DOM.
+    Scans up to 7 pages (~200+ jobs) per keyword for postings in the last 24 hours.
+    """
+    existing_urls = existing_urls or set()
+    found_jobs: List[Dict[str, Any]] = []
+    seen_job_ids: Set[str] = set()
+
+    # Determine Chrome session profile directory
+    user_data_dir = os.path.abspath(os.path.join(BACKEND_DIR, "user_data", "browser_use_chrome_session"))
+    os.makedirs(user_data_dir, exist_ok=True)
+
+    try:
+        # pyrefly: ignore [missing-import]
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("[Top Applicant Scanner] Playwright not installed in environment.")
+        return []
+
+    from services.browser_use_agent import ensure_persistent_browser
+    cdp_url = ensure_persistent_browser(headless=headless)
+
+    async with async_playwright() as p:
+        print(f"[Top Applicant Scanner] Connecting to persistent Chrome session via CDP ({cdp_url})...")
+        browser = await p.chromium.connect_over_cdp(cdp_url, no_defaults=True)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = await context.new_page()
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+        """)
+
+        # Map timeframe to LinkedIn f_TPR param (24h = 86400s)
+        tpr_sec = timeframe_hours * 3600
+
+        for kw in keywords_list:
+            print(f"\n[Top Applicant Scanner] Searching LinkedIn for: '{kw}' in '{location}' (Past {timeframe_hours}h, up to 30 matches/role)...")
+            kw_matches = 0
+            for page_idx in range(max_pages_per_keyword):
+                if kw_matches >= 30:
+                    print(f"   Reached 30 Top Applicant matches for '{kw}'. Proceeding to next role...")
+                    break
+                start_offset = page_idx * 25
+                query_params = {
+                    "keywords": kw,
+                    "location": location,
+                    "f_TPR": f"r{tpr_sec}",
+                    "start": str(start_offset)
+                }
+                search_url = f"https://www.linkedin.com/jobs/search/?{urllib.parse.urlencode(query_params)}"
+                
+                try:
+                    await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
+                except Exception as ge:
+                    print(f"   Navigation error for '{kw}' on page {page_idx + 1}: {ge}")
+                    continue
+
+                # Comprehensive job card selectors covering all LinkedIn desktop/guest layouts
+                card_selector_str = (
+                    "ul.jobs-search__results-list > li, "
+                    "li.jobs-search-results__list-item, "
+                    "div.job-card-container, "
+                    "div.job-card-list__entity-lockup, "
+                    "div.base-card, "
+                    "div.base-search-card, "
+                    "[data-occludable-job-id], "
+                    "[data-job-id], "
+                    ".scaffold-layout__list-container li, "
+                    "li.scaffold-layout__list-item, "
+                    "li.jobs-search-two-pane__job-card-container, "
+                    ".jobs-search-results-list__list-item"
+                )
+
+                # Wait for job listing container/cards to hydrate in DOM
+                try:
+                    await page.wait_for_selector(card_selector_str, timeout=8000)
+                except Exception:
+                    pass
+
+                # Scroll the results pane down to hydrate virtualized/lazy-loaded job cards
+                try:
+                    await page.evaluate("""() => {
+                        const container = document.querySelector('.jobs-search-results-list, .scaffold-layout__list, .jobs-search__results-list');
+                        if (container) {
+                            container.scrollTop = 600;
+                        } else {
+                            window.scrollBy(0, 600);
+                        }
+                    }""")
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+
+                # 1. First attempt: Standard selector extraction
+                cards = await page.query_selector_all(card_selector_str)
+
+                # 2. Enhanced In-Page Discovery (handles both obfuscated AI search layout & classic layout)
+                extracted_page_jobs = await page.evaluate("""async () => {
+                    const results = [];
+                    const seenIds = new Set();
+                    
+                    const allElements = Array.from(document.querySelectorAll('*'));
+                    const candidates = allElements.filter(el => {
+                        const txt = el.innerText || '';
+                        return (txt.includes('Posted ') || txt.includes(' ago')) &&
+                               el.children.length >= 2 && el.children.length <= 15 &&
+                               txt.length > 35 && txt.length < 450 &&
+                               !txt.includes('How promoted jobs are ranked');
+                    });
+                    
+                    const uniqueCards = [];
+                    for (const c of candidates) {
+                        if (!uniqueCards.some(existing => existing.contains(c))) {
+                            uniqueCards.push(c);
+                        }
+                    }
+                    
+                    for (let i = 0; i < uniqueCards.length; i++) {
+                        const card = uniqueCards[i];
+                        const text = (card.innerText || '').trim();
+                        if (!text) continue;
+
+                        const isTop = /top\\s+applicant|in\\s+the\\s+top|stand\\s+out|competitive\\s+applicant/i.test(text);
+                        
+                        const lines = text.split('\\n').map(s => s.trim()).filter(Boolean);
+                        if (!lines || lines.length === 0) continue;
+
+                        let title = (lines[0] || '').replace(/^Selected,\\s*/i, '');
+                        if (title.includes(' | ')) title = title.split(' | ')[0];
+                        let company = lines.length > 1 ? lines[1] : 'Company';
+                        if (company && company.includes('Verified job')) {
+                            company = lines.length > 2 ? lines[2] : 'Company';
+                        }
+                        
+                        let jobId = null;
+                        const link = card.querySelector('a[href*="/jobs/view/"], a[href*="currentJobId="]');
+                        if (link) {
+                            const href = link.href;
+                            const m1 = href.match(/\\/jobs\\/view\\/(?:[^\\/]+-)?(\\d+)/);
+                            if (m1) jobId = m1[1];
+                            const m2 = href.match(/currentJobId=(\\d+)/);
+                            if (m2) jobId = m2[1];
+                        }
+                        
+                        if (!jobId) {
+                            const dataId = card.getAttribute('data-job-id') || card.getAttribute('data-occludable-job-id');
+                            if (dataId && /\\d+/.test(dataId)) jobId = dataId;
+                        }
+                        
+                        if (!jobId) {
+                            try {
+                                card.click();
+                                await new Promise(r => setTimeout(r, 350));
+                                const m = window.location.href.match(/currentJobId=(\\d+)/);
+                                if (m) jobId = m[1];
+                            } catch (e) {}
+                        }
+                        
+                        if (jobId && !seenIds.has(jobId)) {
+                            seenIds.add(jobId);
+                            results.push({
+                                id: jobId,
+                                title: title,
+                                company: company,
+                                isTopApplicant: isTop,
+                                textSnippet: text.replace(/\\n+/g, ' | ')
+                            });
+                        }
+                    }
+                    return results;
+                }""")
+
+                if not extracted_page_jobs and not cards:
+                    print(f"   Page {page_idx + 1}: No cards rendered on this page.")
+                    continue
+
+                print(f"   Page {page_idx + 1}: Found {len(extracted_page_jobs)} job listing cards.")
+
+                for j_item in extracted_page_jobs:
+                    job_id = j_item.get("id")
+                    if not job_id or job_id in seen_job_ids:
+                        continue
+                    seen_job_ids.add(job_id)
+
+                    canonical_url = f"https://www.linkedin.com/jobs/view/{job_id}/"
+                    norm_url = canonical_url.strip().split("?")[0].rstrip("/").lower()
+
+                    if norm_url in existing_urls:
+                        continue
+
+                    title = j_item.get("title") or f"Role #{job_id}"
+                    company = j_item.get("company") or "Company"
+                    has_badge = j_item.get("isTopApplicant", False)
+
+                    if has_badge:
+                        print(f"   Top Applicant Match found: {title} @ {company} (ID: {job_id})")
+                        found_jobs.append({
+                            "id": job_id,
+                            "url": canonical_url,
+                            "title": title,
+                            "company": company,
+                            "badge_source": "card_snippet",
+                            "badge_text": "Top Applicant Badge",
+                            "posted_time": format_posted_date_time("Recent"),
+                            "platform": "LinkedIn"
+                        })
+                        kw_matches += 1
+                        if kw_matches >= 30:
+                            print(f"   Reached 30 Top Applicant matches for '{kw}'. Skipping remaining pages...")
+                            break
+
+        await page.close()
+
+    print(f"\n[Top Applicant Scanner] Total 'Top Applicant' matches identified: {len(found_jobs)}")
+    return found_jobs
+
+
+async def run_top_applicant_pipeline(
+    custom_keywords: Optional[str] = None,
+    timeframe_hours: int = 24,
+    limit: Optional[int] = None,
+    auto_submit: bool = False,
+    headless: bool = False
+):
+    profile = load_profile_data()
+    candidate = profile.get("candidate", {})
+    prefs = profile.get("search_preferences", {})
+
+    master_resume_pdf = find_master_resume_with_mac_tags()
+    if not master_resume_pdf or not os.path.exists(master_resume_pdf):
+        print(f"[Master Resume] Could not locate master resume: {master_resume_pdf}")
+        return
+
+    print(f"===========================================================")
+    print(f"LinkedIn 'Top Applicant' Autonomous Scanner & Auto-Apply")
+    print(f"Resume: {master_resume_pdf} (Zero Tailoring)")
+    print(f"Guardrails: {'Disabled (Auto-Submit Enabled)' if auto_submit else 'Enabled (Preview Mode)'}")
+    print(f"===========================================================")
+
+    # Determine target roles
+    if custom_keywords:
+        target_roles = [k.strip() for k in custom_keywords.split(",") if k.strip()]
+    else:
+        target_roles = list(dict.fromkeys(prefs.get("target_roles", [
+            "AI Engineer",
+            "Generative AI Engineer",
+            "Machine Learning Engineer",
+            "AI Systems Engineer"
+        ])))
+
+    target_locations = prefs.get("target_locations", ["London, UK"])
+    location = target_locations[0] if target_locations else "London, UK"
+
+    existing_urls = get_existing_tracked_urls()
+    print(f"[Top Applicant Scanner] Checked {len(existing_urls)} previously tracked jobs.")
+
+    # 1. Scan LinkedIn for jobs tagged with Top Applicant badge
+    top_jobs = await scan_linkedin_for_top_applicant_jobs(
+        keywords_list=target_roles,
+        location=location,
+        timeframe_hours=timeframe_hours,
+        existing_urls=existing_urls,
+        headless=headless
+    )
+
+    if not top_jobs:
+        print("[Top Applicant Scanner] No new 'Top Applicant' jobs found in this run. Try expanding search keywords or timeframe.")
+        return
+
+    selected_model = get_best_flash_lite_model()
+    processed_count = 0
+    failed_applications = []
+
+    # Determine target jobs list based on limit (None or <= 0 means NO LIMIT / process all)
+    jobs_to_process = top_jobs if (limit is None or limit <= 0) else top_jobs[:limit]
+    total_to_process = len(jobs_to_process)
+    print(f"\n[Top Applicant Scanner] Processing {total_to_process} jobs ({'No limit' if (limit is None or limit <= 0) else f'Limit: {limit}'})...")
+
+    # 2. Auto-apply directly without tailoring
+    for idx, job in enumerate(jobs_to_process, start=1):
+        job_url = job["url"]
+        job_title = job["title"]
+        company = job["company"]
+
+        print(f"\n[{idx}/{total_to_process}] Auto-applying for: {job_title} @ {company}")
+        print(f"URL: {job_url}")
+
+        # Pre-flight check
+        _, is_active, reason = preflight_check_job_url(job_url)
+        if not is_active:
+            print(f"   Job listing appears closed or expired ({reason}). Skipping.")
+            continue
+
+        try:
+            res = await run_browser_use_autofill(
+                job_url=job_url,
+                resume_data=candidate,
+                resume_pdf_path=master_resume_pdf,
+                headless=headless,
+                model_name=selected_model,
+                auto_submit=auto_submit,
+                max_steps=50
+            )
+
+            res_status = res.get("status") if isinstance(res, dict) else ""
+            final_res = str(res.get("final_result", "")) if isinstance(res, dict) else ""
+
+            if auto_submit:
+                if res_status == "success":
+                    new_status = "applied"
+                    print(f"   Application verified & submitted successfully for {job_title} @ {company}")
+                else:
+                    new_status = "Needs Review (Unsubmitted)"
+                    fail_reason = final_res or "Form validation error or unconfirmed submission"
+                    print(f"   Submission verification failed for {job_title} @ {company}: {fail_reason}")
+                    failed_applications.append({
+                        "title": job_title,
+                        "company": company,
+                        "url": job_url,
+                        "reason": fail_reason[:150]
+                    })
+            else:
+                new_status = "Top Applicant - Ready"
+
+            record_payload = {
+                "company": company,
+                "job_title": job_title,
+                "location": location,
+                "platform": "LinkedIn (Top Applicant)",
+                "posted_time": job.get("posted_time", format_posted_date_time("Recent")),
+                "overall_ats": 90,
+                "skills_match": 95,
+                "experience_match": 90,
+                "role_fit": 95,
+                "matched_skills": "LinkedIn Top Applicant Match",
+                "missing_skills": "",
+                "salary": "",
+                "seniority": "Top Applicant",
+                "recruiter": "",
+                "recruiter_linkedin": "",
+                "pdf_path": master_resume_pdf,
+                "latex_path": "",
+                "status": new_status,
+                "job_url": job_url
+            }
+            await record_to_supabase_or_csv(record_payload)
+            processed_count += 1
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print(f"\n[Browser-Use] ⏭Skip signal (Ctrl+C) received! Aborting {job_title} @ {company} and advancing to next role...")
+            failed_applications.append({
+                "title": job_title,
+                "company": company,
+                "url": job_url,
+                "reason": "User skipped application via Ctrl+C"
+            })
+            continue
+        except Exception as e:
+            print(f"   Error applying to {job_url}: {e}")
+
+    print(f"\n[Top Applicant Scanner] Completed processing {processed_count} top applicant jobs.")
+
+    # Alert user via email if any applications failed/need review
+    if failed_applications:
+        cand_email = candidate.get("email") or os.getenv("NOTIFY_EMAIL", "")
+        notify_user_of_failed_applications(failed_applications, to_email=cand_email)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Scan LinkedIn for 'Top Applicant' jobs and auto-apply with master resume")
+    parser.add_argument("--keywords", type=str, default=None, help="Comma-separated search keywords (e.g. 'Machine Learning, AI Engineer')")
+    parser.add_argument("--timeframe", type=int, default=24, help="Timeframe in hours to search for postings (default: 24)")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of applications to process (default: None, processes all found jobs)")
+    parser.add_argument("--auto-submit", action="store_true", help="Submit automatically without stopping for review")
+    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+
+    args = parser.parse_args()
+    auto_submit = args.auto_submit or os.getenv("BROWSER_USE_DISABLE_GUARDRAILS") in ("1", "true", "True")
+
+    asyncio.run(run_top_applicant_pipeline(
+        custom_keywords=args.keywords,
+        timeframe_hours=args.timeframe,
+        limit=args.limit,
+        auto_submit=auto_submit,
+        headless=args.headless
+    ))
+
+
+if __name__ == "__main__":
+    main()

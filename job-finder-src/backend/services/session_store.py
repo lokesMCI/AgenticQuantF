@@ -1,0 +1,258 @@
+import os
+import json
+import glob
+import queue
+import threading
+import asyncio
+from typing import Optional, Tuple, Any, Dict, List
+# pyrefly: ignore [missing-import]
+from services.auth import get_user_by_token
+# pyrefly: ignore [missing-import]
+from config.constants import resolve_workspace_root, get_output_dir
+
+BASE_DIR = resolve_workspace_root()
+
+# Persistent Storage Root:
+# If HF persistent volume (/data) is mounted, use it; otherwise use resolved workspace root.
+if os.path.exists("/data") and os.access("/data", os.W_OK):
+    STORAGE_ROOT = "/data"
+else:
+    STORAGE_ROOT = BASE_DIR
+
+UPLOAD_DIR = os.path.join(STORAGE_ROOT, "uploads")
+OUTPUT_DIR = os.path.join(STORAGE_ROOT, "output")
+USER_DATA_DIR = os.path.join(STORAGE_ROOT, "user_data")
+
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+# Central thread-safe in-memory session store
+_session_store: dict = {}
+_store_lock = threading.Lock()
+
+# Central LLM Client log queue
+LLMClientLogQueue: queue.Queue = queue.Queue()
+
+
+def _safe_key(token: Any) -> str:
+    """Sanitize a token or guest ID for use as a filesystem directory name."""
+    if token is None:
+        return "guest"
+    raw = str(token).strip()
+    if not raw:
+        return "guest"
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in raw)
+
+
+def _get_user_storage_dirs(user_id: str) -> Tuple[str, str]:
+    """Return (upload_dir, output_dir) dedicated to a single user_id."""
+    key = _safe_key(user_id)
+    user_upload_dir = os.path.join(USER_DATA_DIR, key, "uploads")
+    user_output_dir = os.path.join(USER_DATA_DIR, key, "output")
+    os.makedirs(user_upload_dir, exist_ok=True)
+    os.makedirs(user_output_dir, exist_ok=True)
+    return user_upload_dir, user_output_dir
+
+
+def _user_output_paths(token: Optional[str]) -> Tuple[str, str]:
+    """Return per-user tex/pdf output paths inside the user's dedicated output subdirectory."""
+    key = _safe_key(token)
+    _, user_out_dir = _get_user_storage_dirs(key)
+    tex_path = os.path.join(user_out_dir, f"tailored_resume_{key}.tex")
+    pdf_path = os.path.join(user_out_dir, f"tailored_resume_{key}.pdf")
+    return tex_path, pdf_path
+
+
+def _ensure_resume_cls(target_dir: str) -> Optional[str]:
+    """Finds resume.cls across package roots, workspace, and assets, and copies it to target_dir."""
+    import shutil
+    dest = os.path.join(target_dir, "resume.cls")
+    if os.path.exists(dest) and os.path.getsize(dest) > 100:
+        return dest
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(UPLOAD_DIR, "resume.cls"),
+        os.path.join(BASE_DIR, "assets", "resume.cls"),
+        os.path.join(BASE_DIR, "backend", "assets", "resume.cls"),
+        os.path.join(os.path.dirname(this_dir), "assets", "resume.cls"),
+        os.path.join(this_dir, "assets", "resume.cls"),
+        os.path.join(os.path.dirname(os.path.dirname(this_dir)), "backend", "assets", "resume.cls"),
+        os.path.join(os.path.dirname(os.path.dirname(this_dir)), "assets", "resume.cls"),
+        "/app/backend/assets/resume.cls",
+        "/app/assets/resume.cls",
+        os.path.join(OUTPUT_DIR, "resume.cls"),
+        os.path.join(os.getcwd(), "resume.cls"),
+        os.path.join(os.getcwd(), "backend", "assets", "resume.cls"),
+        os.path.join(os.getcwd(), "assets", "resume.cls"),
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.path.isfile(c) and os.path.getsize(c) > 100:
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.copy2(c, dest)
+                return dest
+            except Exception:
+                pass
+    return None
+
+
+# Bootstrap core assets (resume.cls, master_resume_template.tex) into persistent storage on init
+def _bootstrap_assets():
+    import shutil
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    asset_sources = [
+        os.path.join(os.path.dirname(this_dir), "assets"),
+        os.path.join(this_dir, "assets"),
+        os.path.join(BASE_DIR, "backend", "assets"),
+        os.path.join(BASE_DIR, "assets"),
+        "/app/backend/assets",
+        "/app/assets",
+    ]
+    src_dir = next((d for d in asset_sources if os.path.exists(os.path.join(d, "resume.cls"))), None)
+    if src_dir:
+        for fname in ("resume.cls", "master_resume_template.tex"):
+            src_file = os.path.join(src_dir, fname)
+            if os.path.exists(src_file):
+                for target in (UPLOAD_DIR, OUTPUT_DIR):
+                    try:
+                        os.makedirs(target, exist_ok=True)
+                        dest_file = os.path.join(target, fname)
+                        if not os.path.exists(dest_file) or os.path.getsize(dest_file) < 100:
+                            shutil.copy2(src_file, dest_file)
+                    except Exception:
+                        pass
+
+_bootstrap_assets()
+
+
+def drain_llm_logs() -> list:
+    """Non-blocking drain of all currently-queued LLM client log messages."""
+    messages = []
+    while True:
+        try:
+            msg = LLMClientLogQueue.get(block=False)
+        except queue.Empty:
+            break
+        except Exception as e:
+            print(f"[drain_llm_logs] Unexpected error draining log queue: {e}")
+            break
+        messages.append(msg)
+    return messages
+
+
+def _format_log_event(msg: str) -> str:
+    """Turns one raw LLMClientLogQueue message into an SSE-ready JSON line."""
+    try:
+        parsed = json.loads(msg)
+        if parsed.get("type") == "llm_warn":
+            return json.dumps({"type": "llm_warn", "message": parsed.get("message"), "model": parsed.get("model", ""), "wait_s": parsed.get("wait_s", 10)}) + "\n"
+        return json.dumps({"type": "log", "message": parsed.get("message")}) + "\n"
+    except Exception:
+        if "429" in msg or "rate limit" in msg.lower() or "Rate limit" in msg:
+            return json.dumps({"type": "llm_warn", "message": msg, "model": "", "wait_s": 10}) + "\n"
+        return json.dumps({"type": "log", "message": msg}) + "\n"
+
+
+async def _stream_task_logs(task: asyncio.Task):
+    """Polls drain_llm_logs() every 0.5s and yields formatted SSE lines until task completes."""
+    while not task.done():
+        for msg in drain_llm_logs():
+            yield _format_log_event(msg)
+        await asyncio.sleep(0.5)
+
+
+def _drain_remaining_logs():
+    """Formats any log messages left in the queue after a task has completed."""
+    return [_format_log_event(msg) for msg in drain_llm_logs()]
+
+
+def get_session_data(token: Optional[str]) -> dict:
+    key = token or "guest"
+    with _store_lock:
+        data = _session_store.get(key)
+        if data and data.get("data") and (data["data"].get("education") or data["data"].get("name") or data["data"].get("skills")):
+            return data
+
+    # Try fetching from Supabase if token exists and not a local test guest
+    if token and not token.startswith("guest_") and not token.startswith("usr_"):
+        try:
+            user = get_user_by_token(token)
+            if user:
+                user_id = user.get("id")
+                if user_id:
+                    # pyrefly: ignore [missing-import]
+                    from services.auth import supabase_request
+                    res = supabase_request(f"user_resumes?user_id=eq.{user_id}", "GET")
+                    if res and len(res) > 0:
+                        raw_rdata = res[0].get("resume_data", {})
+                        resume_dict = json.loads(raw_rdata) if isinstance(raw_rdata, str) else (raw_rdata or {})
+                        path = ""
+                        master_latex = res[0].get("master_latex", "")
+                        if master_latex:
+                            user_up_dir, _ = _get_user_storage_dirs(str(user_id))
+                            path = os.path.join(user_up_dir, f"{user_id}_master.tex")
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(master_latex)
+                        with _store_lock:
+                            _session_store[token] = {"data": resume_dict, "path": path}
+                        return {"data": resume_dict, "path": path}
+        except Exception as e:
+            print(f"Failed to load resume from Supabase user session: {e}")
+
+    # Check user-specific directory for their saved state file only
+    try:
+        user_key = _safe_key(token)
+        user_state_file = os.path.join(OUTPUT_DIR, user_key, f"resume_state_{user_key}.json")
+        if not os.path.exists(user_state_file):
+            user_state_file = os.path.join(USER_DATA_DIR, user_key, "output", f"resume_state_{user_key}.json")
+        if os.path.exists(user_state_file):
+            with open(user_state_file, "r", encoding="utf-8") as f:
+                content = json.load(f)
+                d = content.get("data", {})
+                if d and (d.get("education") or d.get("skills") or d.get("name")):
+                    with _store_lock:
+                        _session_store[key] = {"data": d, "path": content.get("path", "")}
+                    return {"data": d, "path": content.get("path", "")}
+    except Exception as ex:
+        print(f"[get_session_data] Error searching state files: {ex}")
+
+    # If no resume exists for this specific user/session, return clean empty dict
+    return {"data": {}, "path": ""}
+
+
+def set_session_data(token: Optional[str], data: dict, path: str):
+    key = token or "guest"
+    with _store_lock:
+        _session_store[key] = {"data": data, "path": path}
+
+    if token:
+        master_latex = ""
+        if path and os.path.exists(path) and path.endswith(".tex"):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    master_latex = f.read()
+            except Exception as e:
+                print(f"Failed to read master latex: {e}")
+
+        try:
+            user = get_user_by_token(token)
+            if user and user.get("id") and not str(user.get("id")).startswith("guest_"):
+                user_id = user["id"]
+                # pyrefly: ignore [missing-import]
+                from services.auth import supabase_request
+                existing = supabase_request(f"user_resumes?user_id=eq.{user_id}", "GET")
+                record = {
+                    "user_id": user_id,
+                    "resume_data": data,
+                    "master_latex": master_latex,
+                    "updated_at": "now()"
+                }
+                if existing and len(existing) > 0:
+                    supabase_request(f"user_resumes?user_id=eq.{user_id}", "PATCH", record)
+                else:
+                    supabase_request("user_resumes", "POST", record)
+        except Exception as e:
+            print(f"Failed to persist resume to Supabase user session: {e}")

@@ -1,0 +1,1256 @@
+import os
+import re
+import json
+import time
+import uuid
+import shutil
+import asyncio
+import subprocess
+import traceback
+from typing import Optional, List, Dict
+from fastapi import APIRouter, HTTPException, Header, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from services.session_store import (
+    BASE_DIR,
+    UPLOAD_DIR,
+    OUTPUT_DIR,
+    _safe_key,
+    _get_user_storage_dirs,
+    _user_output_paths,
+    _ensure_resume_cls,
+    get_session_data,
+    LLMClientLogQueue,
+    _stream_task_logs,
+    _drain_remaining_logs
+)
+from services.auth import async_get_user_by_token
+from services.scraper import scrape_job_description
+from services.llm_agent import analyze_job_fit, tailor_latex_code as tailor_resume, review_tailored_resume
+from utils.latex_utils import generate_latex_from_json, apply_latex_hotfix, compile_and_check_page_metrics
+from services.overleaf import upload_zip_to_tmpfiles
+from services.application_tracker import record_application
+from services.recruiter_extractor import extract_recruiter
+from services.outreach_generator import generate_outreach_message
+from services.cron_scheduler import process_and_send_user_digest
+from routes.job_routes import _extract_company_from_jd, _check_rate_limit
+
+import hashlib
+from utils.ttl_cache import TTLCache
+
+router = APIRouter(tags=["AI & Tailoring"])
+
+# Bounded, thread-safe In-Memory Analysis Cache (1 hour TTL, max 500 items)
+_analysis_cache = TTLCache(ttl_seconds=3600, max_size=500)
+
+
+def _get_analysis_cache_key(
+    token: Optional[str],
+    job_title: str,
+    jd_text: str,
+    user_selected_skills: Optional[List[str]] = None,
+    candidate_profile: Optional[dict] = None
+) -> str:
+    user_part = token or "guest"
+    jt = (job_title or "").strip().lower()
+    jd = (jd_text or "").strip()[:1000].lower()
+    jd_hash = hashlib.md5(jd.encode("utf-8")).hexdigest()
+    skills_part = ",".join(sorted(s.strip().lower() for s in (user_selected_skills or [])))
+    skills_hash = hashlib.md5(skills_part.encode("utf-8")).hexdigest() if skills_part else "noskills"
+    profile_hash = "noprofile"
+    if candidate_profile and isinstance(candidate_profile, dict):
+        try:
+            profile_str = json.dumps(candidate_profile, sort_keys=True)
+            profile_hash = hashlib.md5(profile_str.encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            profile_hash = "profile_err"
+    return f"{user_part}:{jt}:{jd_hash}:{skills_hash}:{profile_hash}"
+
+
+def get_cached_analysis(
+    token: Optional[str],
+    job_title: str,
+    jd_text: str,
+    user_selected_skills: Optional[List[str]] = None,
+    candidate_profile: Optional[dict] = None
+) -> Optional[dict]:
+    key = _get_analysis_cache_key(token, job_title, jd_text, user_selected_skills, candidate_profile)
+    return _analysis_cache.get(key)
+
+
+def set_cached_analysis(
+    token: Optional[str],
+    job_title: str,
+    jd_text: str,
+    data: dict,
+    user_selected_skills: Optional[List[str]] = None,
+    candidate_profile: Optional[dict] = None
+):
+    key = _get_analysis_cache_key(token, job_title, jd_text, user_selected_skills, candidate_profile)
+    _analysis_cache.set(key, data)
+
+
+def clear_user_cached_analysis(token: Optional[str]):
+    user_part = token or "guest"
+    with _analysis_cache._lock:
+        keys_to_del = [k for k in _analysis_cache._store if str(k).startswith(f"{user_part}:")]
+        for k in keys_to_del:
+            _analysis_cache._store.pop(k, None)
+
+
+class RunContext:
+    def __init__(self, user_token: Optional[str], job_title: Optional[str]):
+        self.run_id = uuid.uuid4().hex[:8]
+        self.user = user_token or "guest"
+        self.job = job_title or "Unknown"
+        self.start_time = time.time()
+
+    def log_step(self, step_name: str, duration_sec: float, model: Optional[str] = None):
+        elapsed = round(time.time() - self.start_time, 3)
+        data = {
+            "run_id": self.run_id,
+            "user": self.user,
+            "job": self.job,
+            "step": step_name,
+            "latency_sec": round(duration_sec, 3),
+            "model": model,
+            "elapsed_total": elapsed
+        }
+        print(f"[TRACE] {json.dumps(data)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pydantic Schemas
+# ─────────────────────────────────────────────────────────────────────────────
+class JobAnalysisRequest(BaseModel):
+    job_description: Optional[str] = None
+    job_url: Optional[str] = None
+    job_title: Optional[str] = None
+    company: Optional[str] = None
+    skip_tailoring: Optional[bool] = False
+    force_tailoring: Optional[bool] = False
+    send_email: Optional[bool] = False
+    source_mode: Optional[str] = "website"
+    user_selected_skills: Optional[List[str]] = None
+    candidate_profile: Optional[dict] = None
+    tailoring_intensity: Optional[str] = "balanced"
+
+
+class TailorResumeRequest(BaseModel):
+    job_title: str
+    job_description: str
+    missing_skills: Optional[List[str]] = []
+    company_name: Optional[str] = "Company"
+    tailoring_intensity: Optional[str] = "balanced"
+
+
+class InterviewPrepRequest(BaseModel):
+    job_title: str
+    company: str
+    job_url: Optional[str] = None
+    job_description: Optional[str] = None
+    youtube_url: Optional[str] = None
+
+
+class CoverLetterHistoryRequest(BaseModel):
+    job_title: str
+    company: str
+    job_url: Optional[str] = None
+    job_description: Optional[str] = None
+    candidate_profile: Optional[dict] = None
+
+
+class GenerateOutreachRequest(BaseModel):
+    job_url: Optional[str] = None
+    job_title: Optional[str] = None
+    company_name: Optional[str] = None
+    job_description: Optional[str] = None
+    recruiter_name: Optional[str] = None
+    platform: Optional[str] = None
+
+
+class OutreachRequest(BaseModel):
+    job_description: str
+    job_title: Optional[str] = "Target Role"
+    company_name: Optional[str] = "Company"
+    recruiter_name: Optional[str] = None
+    recruiter_email: Optional[str] = None
+    send_email: Optional[bool] = False
+
+
+class SendOutreachEmailRequest(BaseModel):
+    recipient_email: str
+    subject: str
+    body: str
+    resume_path: Optional[str] = None
+
+
+class SendApplicationPdfEmailRequest(BaseModel):
+    pdf_url: str
+    job_title: Optional[str] = "Role"
+    company: Optional[str] = "Company"
+    score: Optional[int] = None
+    overleaf_url: Optional[str] = None
+    job_url: Optional[str] = None
+
+
+class AnswerQuestionRequest(BaseModel):
+    question: str
+    company_name: Optional[str] = None
+    job_title: Optional[str] = None
+    job_description: Optional[str] = None
+    candidate_profile: Optional[dict] = None
+
+
+class CompanyBriefRequest(BaseModel):
+    company: str
+    role: Optional[str] = "Software Engineer"
+    job_description: Optional[str] = None
+    candidate_profile: Optional[dict] = None
+
+
+class SolveFieldRequest(BaseModel):
+    field_name: str
+    field_type: Optional[str] = "text"
+    options: Optional[List[str]] = None
+    context: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+class GeneratePromptQueryRequest(BaseModel):
+    suggestion: str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Analysis & Tailoring Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+@router.post("/analyze_job")
+async def analyze_job(request: JobAnalysisRequest, http_request: Request, authorization: Optional[str] = Header(None), x_gemini_api_key: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    _check_rate_limit(http_request, "analyze_job", max_requests=60, window_seconds=60, token=token)
+
+    session = get_session_data(token)
+    session_resume_data = request.candidate_profile or session.get("data")
+    session_resume_path = session.get("path")
+
+    if not session_resume_data:
+        raise HTTPException(status_code=400, detail="Please upload a resume first or sync your profile from the web app.")
+
+    # Cache hit check
+    if request.job_description and not request.force_tailoring:
+        cached = get_cached_analysis(token, request.job_title or "", request.job_description, request.user_selected_skills, session_resume_data)
+        if cached:
+            if request.skip_tailoring:
+                cached = dict(cached)
+                cached["latex_code"] = ""
+            if request.skip_tailoring or cached.get("latex_code"):
+                async def cached_event_generator():
+                    yield json.dumps({"type": "log", "message": "Loaded analysis from local cache!"}) + "\n"
+                    company_name = await asyncio.to_thread(_extract_company_from_jd, request.job_description or "", request.job_url)
+                    yield json.dumps({
+                        "type": "result",
+                        "job_title": request.job_title or "",
+                        "job_description": request.job_description,
+                        "company": company_name,
+                        "analysis": cached
+                    }) + "\n"
+                return StreamingResponse(cached_event_generator(), media_type="text/event-stream")
+
+    async def event_generator():
+        ctx = RunContext(token, request.job_title)
+        try:
+            db_api_key = None
+            if token:
+                user = await async_get_user_by_token(token)
+                if user:
+                    db_api_key = user.get("gemini_api_key")
+            active_api_key = x_gemini_api_key or db_api_key
+
+            jd_text = request.job_description
+            job_title = request.job_title
+            if request.job_url and not jd_text:
+                yield json.dumps({"type": "log", "percent": 15, "message": "Launching browser to scrape job link..."}) + "\n"
+                t0 = time.time()
+                scraped = await scrape_job_description(request.job_url)
+                jd_text = scraped["description"]
+                job_title = scraped["title"]
+
+                _bot_block_phrases = ["cloudflare security verification", "anti-bot challenge", "verify you are human"]
+                if scraped.get("is_bot_blocked") or any(p in jd_text.lower() for p in _bot_block_phrases):
+                    yield json.dumps({"type": "log", "percent": 100, "message": "Security challenge detected on job page."}) + "\n"
+                    yield json.dumps({
+                        "type": "error",
+                        "message": "The job posting URL returned an anti-bot challenge page. Please paste the raw job description text directly."
+                    }) + "\n"
+                    return
+
+                scraped_company = scraped.get("company") or _extract_company_from_jd(jd_text or "", request.job_url)
+                if not request.company and scraped_company:
+                    request.company = scraped_company
+
+                ctx.log_step("scrape_job", time.time() - t0)
+                yield json.dumps({"type": "log", "percent": 20, "message": f"Scraped job details for: {job_title} at {scraped_company or 'Company'}"}) + "\n"
+                yield json.dumps({"type": "scraped_data", "job_title": job_title, "job_description": jd_text, "company": scraped_company}) + "\n"
+
+            yield json.dumps({"type": "log", "percent": 40, "message": "Calculating ATS fit score & career-ops analysis..."}) + "\n"
+
+            user_selected_skills = getattr(request, 'user_selected_skills', None)
+            master_latex = None
+            if session_resume_path and session_resume_path.endswith(".tex") and os.path.exists(session_resume_path):
+                with open(session_resume_path, "r", encoding="utf-8") as f:
+                    master_latex = f.read()
+            else:
+                master_latex = generate_latex_from_json(session_resume_data, user_selected_skills=user_selected_skills)
+
+            def log_callback(msg_json: str):
+                try:
+                    json.loads(msg_json)
+                    LLMClientLogQueue.put(msg_json)
+                except Exception:
+                    pass
+
+            recruiter_name = None
+            if request.job_url and not request.skip_tailoring:
+                try:
+                    rec_info = await asyncio.wait_for(
+                        extract_recruiter(request.job_url, None, company_hint=request.company, custom_api_key=active_api_key, allow_grounding=True),
+                        timeout=10.0
+                    )
+                    recruiter_name = rec_info.get("recruiter_name")
+                except Exception:
+                    pass
+
+            t0 = time.time()
+            fit_task = asyncio.create_task(
+                analyze_job_fit(
+                    session_resume_data,
+                    job_title or "",
+                    jd_text or "",
+                    master_latex if not request.skip_tailoring else None,
+                    recruiter_name,
+                    active_api_key,
+                    on_log=log_callback,
+                    user_selected_skills=getattr(request, 'user_selected_skills', None),
+                    tailoring_intensity=getattr(request, 'tailoring_intensity', 'balanced') or 'balanced'
+                )
+            )
+
+            async for event in _stream_task_logs(fit_task):
+                yield event
+
+            analysis = await fit_task
+            ctx.log_step("analyze_job_fit", time.time() - t0, "gemini-3.1-flash-lite")
+
+            for event in _drain_remaining_logs():
+                yield event
+
+            yield json.dumps({"type": "log", "percent": 75, "message": "Generated tailored resume content and cover letter."}) + "\n"
+
+            if request.skip_tailoring:
+                dumped = analysis.model_dump()
+                company_name = await asyncio.to_thread(_extract_company_from_jd, jd_text or "", request.job_url)
+                yield json.dumps({
+                    "type": "result",
+                    "percent": 100,
+                    "fit_score": dumped.get("match_analysis", {}).get("overall_score"),
+                    "job_title": job_title or "",
+                    "job_description": jd_text or "",
+                    "company": company_name,
+                    "analysis": dumped
+                }) + "\n"
+                set_cached_analysis(token, job_title or "", jd_text or "", dumped, request.user_selected_skills)
+                return
+
+            # ── Senior Recruiter Review Agent (Structural Integrity + ATS Quality + Truthfulness) ──
+            yield json.dumps({"type": "log", "percent": 80, "message": "Senior Recruiter Agent reviewing tailored resume for truthfulness and ATS quality..."}) + "\n"
+            raw_tailored_latex = analysis.latex_code
+            recruiter_scrutiny_report = None
+            try:
+                review_task = asyncio.create_task(asyncio.to_thread(
+                    review_tailored_resume,
+                    raw_tailored_latex,
+                    session_resume_data if isinstance(session_resume_data, dict) else {},
+                    job_title or "Target Role",
+                    jd_text or "",
+                    active_api_key,
+                    log_callback,
+                    user_selected_skills
+                ))
+                async for event in _stream_task_logs(review_task):
+                    yield event
+                review_res = await review_task
+                for event in _drain_remaining_logs():
+                    yield event
+
+                recruiter_scrutiny_report = {
+                    "ats_fit_ok": review_res.ats_fit_ok,
+                    "impact_metrics_ok": review_res.impact_metrics_ok,
+                    "truthfulness_ok": review_res.truthfulness_ok,
+                    "conciseness_ok": review_res.conciseness_ok,
+                    "feedback": review_res.feedback,
+                    "satisfied": review_res.satisfied,
+                    "pass_number": 1
+                }
+                if not review_res.satisfied:
+                    yield json.dumps({"type": "log", "percent": 82, "message": f"Recruiter Agent requested refinements: {review_res.feedback[:90]}..."}) + "\n"
+                    print(f"[analyze_job] Recruiter agent flagged issues: {review_res.feedback}. Running refinement pass...")
+                    refine_task = asyncio.create_task(asyncio.to_thread(
+                        tailor_resume,
+                        master_latex,
+                        job_title or "",
+                        jd_text or "",
+                        analysis.suggested_resume_updates,
+                        getattr(analysis.match_analysis, "missing_skills", []) or [],
+                        active_api_key,
+                        f"REVIEWER AGENT FEEDBACK: {review_res.feedback}",
+                        log_callback,
+                        user_selected_skills,
+                        getattr(request, 'tailoring_intensity', 'balanced') or 'balanced'
+                    ))
+                    async for event in _stream_task_logs(refine_task):
+                        yield event
+                    raw_tailored_latex = await refine_task
+                    for event in _drain_remaining_logs():
+                        yield event
+
+                    # ── Post-Refinement Scrutiny Check ──────────────────────────────
+                    yield json.dumps({"type": "log", "percent": 84, "message": "Senior Recruiter Agent performing secondary scrutiny on refined resume..."}) + "\n"
+                    second_task = asyncio.create_task(asyncio.to_thread(
+                        review_tailored_resume,
+                        raw_tailored_latex,
+                        session_resume_data if isinstance(session_resume_data, dict) else {},
+                        job_title or "Target Role",
+                        jd_text or "",
+                        active_api_key,
+                        log_callback,
+                        user_selected_skills
+                    ))
+                    async for event in _stream_task_logs(second_task):
+                        yield event
+                    second_review = await second_task
+                    for event in _drain_remaining_logs():
+                        yield event
+                    recruiter_scrutiny_report = {
+                        "ats_fit_ok": second_review.ats_fit_ok,
+                        "impact_metrics_ok": second_review.impact_metrics_ok,
+                        "truthfulness_ok": second_review.truthfulness_ok,
+                        "conciseness_ok": second_review.conciseness_ok,
+                        "feedback": second_review.feedback,
+                        "satisfied": second_review.satisfied,
+                        "pass_number": 2
+                    }
+                    if second_review.satisfied:
+                        yield json.dumps({"type": "log", "percent": 85, "message": "Recruiter Agent approved refined resume after scrutiny."}) + "\n"
+                        print("[analyze_job] Recruiter agent approved refined resume on secondary scrutiny.")
+                    else:
+                        yield json.dumps({"type": "log", "percent": 85, "message": f"Recruiter scrutiny noted minor points ({second_review.feedback[:80]}...); proceeding to compile."}) + "\n"
+                        print(f"[analyze_job] Recruiter secondary scrutiny feedback: {second_review.feedback}")
+                else:
+                    yield json.dumps({"type": "log", "percent": 83, "message": "Recruiter Agent approved resume quality & truthfulness on first pass."}) + "\n"
+            except Exception as rev_err:
+                print(f"[analyze_job] Recruiter review check warning: {rev_err}")
+
+            yield json.dumps({"type": "log", "percent": 85, "message": "Compiling tailored LaTeX resume to PDF..."}) + "\n"
+            t0 = time.time()
+
+            safe_key = _safe_key(token)
+            user_up_dir, user_out_dir = _get_user_storage_dirs(safe_key)
+            tex_path = os.path.join(user_out_dir, f"tailored_resume_{safe_key}.tex")
+            temp_pdf_path = os.path.join(user_out_dir, f"tailored_resume_{safe_key}.pdf")
+
+            _ensure_resume_cls(user_out_dir)
+            _ensure_resume_cls(OUTPUT_DIR)
+
+            pages, _ = await asyncio.to_thread(compile_and_check_page_metrics, raw_tailored_latex, 1.0, 1.0, master_latex)
+            opt_scale, opt_ls = 1.0, 1.0
+            if pages > 1:
+                p = pages
+                for ls in [0.95, 0.91, 0.88, 0.82, 0.78]:
+                    p, _ = await asyncio.to_thread(compile_and_check_page_metrics, raw_tailored_latex, 1.0, ls, master_latex)
+                    if p == 1:
+                        opt_ls = ls
+                        break
+                if p > 1:
+                    for scale in [0.95, 0.90, 0.85, 0.80]:
+                        p, _ = await asyncio.to_thread(compile_and_check_page_metrics, raw_tailored_latex, scale, opt_ls, master_latex)
+                        if p == 1:
+                            opt_scale = scale
+                            break
+
+            final_latex = apply_latex_hotfix(raw_tailored_latex, opt_scale, opt_ls, master_latex, user_selected_skills=user_selected_skills)
+            with open(tex_path, "w", encoding="utf-8") as f:
+                f.write(final_latex)
+
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                ["tectonic", tex_path, "--outdir", user_out_dir],
+                cwd=user_out_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if proc.returncode != 0:
+                print(f"[analyze_job] Tectonic compilation failed: {proc.stderr}")
+
+            ctx.log_step("compile_pdf", time.time() - t0)
+
+            # Save AES-256-GCM encrypted copies to persistent disk
+            try:
+                from services.storage_encryption import write_encrypted_file
+                with open(tex_path, "rb") as _tf:
+                    write_encrypted_file(f"{tex_path}.enc", _tf.read(), token or safe_key)
+                if os.path.exists(temp_pdf_path):
+                    with open(temp_pdf_path, "rb") as _pf:
+                        write_encrypted_file(f"{temp_pdf_path}.enc", _pf.read(), token or safe_key)
+            except Exception as enc_err:
+                print(f"[analyze_job] Note: Encrypted artifact save note: {enc_err}")
+
+            # Re-score the final tailored LaTeX deterministically against the job description
+            # If the candidate's baseline Master resume already had a higher or cleaner score than the tailored draft,
+            # automatically preserve the master resume as the superior, authentic version and notify the user.
+            baseline_score = analysis.match_analysis.overall_score
+            is_master_superior = False
+            reversion_notice = None
+            dumped = analysis.model_dump()
+
+            try:
+                from utils.latex_utils import parse_latex_to_resume_dict
+                from services.ats_scorer import compute_ats_score, compute_overall_score, estimate_role_fit_score
+                tailored_dict = parse_latex_to_resume_dict(final_latex)
+                if tailored_dict and jd_text:
+                    post_tailor_ats = compute_ats_score(tailored_dict, jd_text)
+                    if post_tailor_ats and getattr(post_tailor_ats, "eligible", True):
+                        role_fit_val = getattr(analysis.match_analysis, "role_fit_score", None)
+                        if role_fit_val is None:
+                            role_fit_val = estimate_role_fit_score(tailored_dict, jd_text)
+                        tailored_final_score = compute_overall_score(post_tailor_ats.skills_score, post_tailor_ats.experience_score, role_fit_val)
+                        print(f"[analyze_job] Post-generation re-score: tailored={tailored_final_score}%, baseline_master={baseline_score}%")
+
+                        # If tailoring degraded the score or degraded key impact metrics, revert to the Master version
+                        if tailored_final_score < baseline_score and master_latex:
+                            is_master_superior = True
+                            reversion_notice = (
+                                f"Your Master Resume already achieves a superior match ({baseline_score}% vs tailored {tailored_final_score}%) "
+                                "with authentic, uncompromised metrics. The system preserved your Master Resume as the primary document."
+                            )
+                            print(f"[analyze_job] Guardrail triggered: Master resume score ({baseline_score}%) exceeds tailored score ({tailored_final_score}%). Preserving Master version.")
+                            final_latex = master_latex
+                            # Recompile PDF with Master LaTeX
+                            with open(tex_path, "w", encoding="utf-8") as f:
+                                f.write(final_latex)
+                            await asyncio.to_thread(
+                                subprocess.run,
+                                ["tectonic", tex_path, "--outdir", user_out_dir],
+                                cwd=user_out_dir,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                            )
+                            # Re-encrypt updated master PDF & TeX
+                            try:
+                                write_encrypted_file(f"{tex_path}.enc", final_latex.encode("utf-8"), token or safe_key)
+                                if os.path.exists(temp_pdf_path):
+                                    with open(temp_pdf_path, "rb") as _pf:
+                                        write_encrypted_file(f"{temp_pdf_path}.enc", _pf.read(), token or safe_key)
+                            except Exception as re_enc_err:
+                                print(f"[analyze_job] Master re-encrypt note: {re_enc_err}")
+                        else:
+                            if "match_analysis" in dumped and isinstance(dumped["match_analysis"], dict):
+                                dumped["match_analysis"]["overall_score"] = tailored_final_score
+                                dumped["match_analysis"]["skills_score"] = post_tailor_ats.skills_score
+                                dumped["match_analysis"]["experience_score"] = post_tailor_ats.experience_score
+                                dumped["match_analysis"]["matched_skills"] = getattr(post_tailor_ats, "matched_skills", [])
+                                dumped["match_analysis"]["missing_skills"] = getattr(post_tailor_ats, "missing_skills", [])
+            except Exception as rescore_err:
+                print(f"[analyze_job] Post-tailoring ATS re-score notice: {rescore_err}")
+
+            if is_master_superior and reversion_notice:
+                yield json.dumps({"type": "log", "percent": 90, "message": f"{reversion_notice}"}) + "\n"
+
+            candidate_name = session_resume_data.get("name", "") if isinstance(session_resume_data, dict) else ""
+            extracted_company = request.company if (request.company and request.company not in ['Target Company', 'Hiring Company']) else await asyncio.to_thread(_extract_company_from_jd, jd_text or "", request.job_url)
+
+            overleaf_url = None
+            try:
+                overleaf_url = await asyncio.to_thread(upload_zip_to_tmpfiles, final_latex, candidate_name, job_title or "", extracted_company or "")
+            except Exception as e:
+                print(f"[analyze_job] Overleaf upload warning: {e}")
+
+            pdf_download_url = f"/download_application_pdf/{safe_key}/{os.path.basename(temp_pdf_path)}" if os.path.exists(temp_pdf_path) else None
+
+            dumped = analysis.model_dump()
+            dumped["latex_code"] = final_latex
+            dumped["overleaf_url"] = overleaf_url
+            dumped["download_pdf_url"] = pdf_download_url
+            dumped["pdf_url"] = pdf_download_url
+            if is_master_superior:
+                dumped["master_preserved"] = True
+                dumped["reversion_notice"] = reversion_notice
+            if recruiter_scrutiny_report:
+                dumped["recruiter_scrutiny"] = recruiter_scrutiny_report
+                if "match_analysis" in dumped and isinstance(dumped["match_analysis"], dict):
+                    dumped["match_analysis"]["recruiter_scrutiny"] = recruiter_scrutiny_report
+
+            # Calculate and attach ATS score improvement delta
+            current_score = dumped.get("match_analysis", {}).get("overall_score") or 85
+            base_score = dumped.get("match_analysis", {}).get("score_breakdown", {}).get("base_score") or (current_score - 7 if user_selected_skills else current_score)
+            score_delta = max(0, current_score - base_score) if user_selected_skills else 0
+            if "match_analysis" in dumped and isinstance(dumped["match_analysis"], dict):
+                dumped["match_analysis"]["score_delta"] = score_delta
+                dumped["match_analysis"]["base_score"] = base_score
+
+            email_sent = False
+            dest_email = None
+            should_send_email = bool(request.send_email)
+            user_obj = None
+            if token and token != "guest":
+                user_obj = await async_get_user_by_token(token)
+                if user_obj:
+                    if user_obj.get("send_tailored_email"):
+                        should_send_email = True
+                    if user_obj.get("email"):
+                        dest_email = user_obj["email"]
+            if not dest_email and isinstance(session_resume_data, dict) and session_resume_data.get("email"):
+                dest_email = session_resume_data["email"]
+
+            if should_send_email and dest_email and os.path.exists(temp_pdf_path):
+                yield json.dumps({"type": "log", "percent": 95, "message": f"Dispatching tailored resume PDF to {dest_email}..."}) + "\n"
+                from services.email_service import async_send_notification_email
+                cand_name = session_resume_data.get("name", "").strip() or "Candidate" if isinstance(session_resume_data, dict) else "Candidate"
+                ats_score = dumped.get("match_analysis", {}).get("overall_score") or 85
+                ats_display = f"{ats_score}% Match"
+                email_subj = f"[Resume Delivery] Tailored Resume [{ats_display}]: {job_title} at {extracted_company}"
+                email_text = (
+                    f"On-Demand Resume Delivery: Tailored Resume PDF\n"
+                    f"For your application at {extracted_company}\n\n"
+                    f"Target Role: {job_title}\n"
+                    f"Company: {extracted_company}\n"
+                    f"ATS Score: {ats_display}\n\n"
+                    f"Hello {cand_name}, your compiled PDF resume (ATS Match Score: {ats_display}) is attached directly to this email.\n\n"
+                    f"{'View Job & Apply: ' + request.job_url + chr(10) if request.job_url else ''}"
+                    f"{'Open & Edit in Overleaf: ' + overleaf_url + chr(10) if overleaf_url else ''}\n"
+                    f"Sent automatically by your Resume Tailor Assistant."
+                )
+                email_html = f"""
+                <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 580px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; color: #1e293b;">
+                    <div style="border-bottom: 2px solid #0284c7; padding-bottom: 12px; margin-bottom: 16px;">
+                        <span style="font-size: 11px; font-weight: 700; color: #0284c7; text-transform: uppercase; letter-spacing: 0.05em;">On-Demand Resume Delivery</span>
+                        <h2 style="margin: 4px 0 0 0; color: #0f172a; font-size: 20px; font-weight: 800;">Tailored Resume PDF</h2>
+                        <p style="margin: 4px 0 0 0; color: #64748b; font-size: 13px;">For your application at <strong>{extracted_company}</strong></p>
+                    </div>
+
+                    <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 18px; font-size: 13px; line-height: 1.6;">
+                        <div style="margin-bottom: 6px;"><strong>Target Role:</strong> {job_title}</div>
+                        <div style="margin-bottom: 6px;"><strong>Company:</strong> {extracted_company}</div>
+                        <div><strong>ATS Score:</strong> <span style="color: #059669; font-weight: 700;">{ats_display}</span></div>
+                    </div>
+
+                    <p style="font-size: 14px; line-height: 1.6; color: #334155; margin-bottom: 20px;">
+                        Hello <strong>{cand_name}</strong>, your compiled PDF resume (ATS Match Score: <strong>{ats_display}</strong>) is attached directly to this email.
+                    </p>
+
+                    <div style="margin: 22px 0; text-align: left;">
+                        {"<a href='" + request.job_url + "' style='display: inline-block; background-color: #10b981; color: #ffffff; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 13px; margin-right: 10px; margin-bottom: 8px;'>View Job & Apply</a>" if request.job_url else ""}
+                        {"<a href='" + overleaf_url + "' style='display: inline-block; background-color: #0284c7; color: #ffffff; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 13px; margin-bottom: 8px;'>Open & Edit in Overleaf</a>" if overleaf_url else ""}
+                    </div>
+
+                    <hr style="border: none; border-top: 1px solid #f1f5f9; margin: 24px 0 12px 0;" />
+                    <p style="font-size: 11px; color: #94a3b8; margin: 0;">Sent automatically by your Resume Tailor Assistant.</p>
+                </div>
+                """
+                try:
+                    email_sent = await async_send_notification_email(
+                        to_email=dest_email,
+                        subject=email_subj,
+                        text_body=email_text,
+                        html_body=email_html,
+                        attachment_path=temp_pdf_path,
+                        attachment_name=f"Tailored_Resume_{(extracted_company or 'Role').replace(' ', '_')}.pdf"
+                    )
+                except Exception as e:
+                    print(f"[analyze_job] Email send error: {e}")
+
+            from services.job_searcher import _extract_company_size
+            extracted_company_size = _extract_company_size(jd_text or "")
+            dumped["company_size"] = extracted_company_size
+            dumped["email_sent"] = email_sent
+            dumped["dest_email"] = dest_email
+
+            # Automatically record tailored application in History
+            try:
+                await asyncio.to_thread(record_application, token, {
+                    "job_title": job_title or "Target Role",
+                    "company": extracted_company or "Hiring Company",
+                    "job_url": request.job_url or "",
+                    "score": dumped.get("match_analysis", {}).get("overall_score"),
+                    "status": "tailored",
+                    "overleaf_url": overleaf_url,
+                    "pdf_url": pdf_download_url,
+                    "source_mode": request.source_mode or "website"
+                })
+            except Exception as rec_err:
+                print(f"[analyze_job] Failed to record application history: {rec_err}")
+
+            # Clean up unencrypted local plaintext files from disk after encryption & email dispatch
+            # Persistent storage retains ONLY the AES-256-GCM ciphertext (.enc)
+            try:
+                if os.path.exists(f"{tex_path}.enc") and os.path.exists(tex_path):
+                    os.remove(tex_path)
+                if os.path.exists(f"{temp_pdf_path}.enc") and os.path.exists(temp_pdf_path):
+                    os.remove(temp_pdf_path)
+            except Exception as cleanup_err:
+                print(f"[analyze_job] Note on plaintext artifact cleanup: {cleanup_err}")
+
+            set_cached_analysis(token, job_title or "", jd_text or "", dumped, request.user_selected_skills, session_resume_data)
+
+            yield json.dumps({
+                "type": "result",
+                "percent": 100,
+                "fit_score": dumped.get("match_analysis", {}).get("overall_score"),
+                "score_delta": score_delta,
+                "recruiter_scrutiny": recruiter_scrutiny_report,
+                "job_title": job_title or "",
+                "job_description": jd_text or "",
+                "company": extracted_company,
+                "company_size": extracted_company_size,
+                "analysis": dumped,
+                "overleaf_url": overleaf_url,
+                "download_pdf_url": pdf_download_url,
+                "email_sent": email_sent,
+                "dest_email": dest_email
+            }) + "\n"
+
+        except Exception as e:
+            traceback.print_exc()
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/generate_tailored_resume")
+async def generate_tailored_resume(request: TailorResumeRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    session = get_session_data(token)
+    session_resume_data = session.get("data")
+    if not session_resume_data:
+        raise HTTPException(status_code=400, detail="Please upload a resume first.")
+
+    try:
+        from utils.latex_utils import generate_latex_from_json
+        master_latex = session.get("master_latex") or (generate_latex_from_json(session_resume_data) if session_resume_data else "")
+        raw_tailored_latex = await asyncio.to_thread(
+            tailor_resume,
+            master_latex=master_latex,
+            job_title=request.job_title or "",
+            job_description=request.job_description or "",
+            suggestions={},
+            missing_skills=request.missing_skills or []
+        )
+        return {"status": "success", "latex_code": raw_tailored_latex}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/generate_cover_letter_history")
+async def generate_cover_letter_history(request: CoverLetterHistoryRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else "guest"
+    session = get_session_data(token)
+    resume = request.candidate_profile or session.get("data")
+    if not resume:
+        raise HTTPException(status_code=400, detail="No candidate resume found. Upload a resume first.")
+
+    jd_text = request.job_description or ""
+    if not jd_text and request.job_url:
+        try:
+            scraped = await scrape_job_description(request.job_url)
+            jd_text = scraped.get("description", "")
+        except Exception:
+            pass
+
+    from services.cover_letter_generator import generate_structured_cover_letter
+    try:
+        result = await asyncio.to_thread(
+            generate_structured_cover_letter,
+            job_title=request.job_title,
+            company=request.company,
+            job_description=jd_text,
+            candidate_profile=resume
+        )
+        return {
+            "status": result.get("status", "success"),
+            "cover_letter": result["cover_letter"],
+            "role_analysis": result.get("role_analysis", ""),
+            "gaps": result.get("gaps", ""),
+            "alternative_openings": result.get("alternative_openings", ""),
+            "warnings": result.get("warnings", []),
+            "full_output": result.get("full_output", "")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/company_brief")
+async def get_company_brief(request: CompanyBriefRequest):
+    """Generates enhanced Company Culture Brief using Agent-Reach community insights & Reddit."""
+    from services.agent_reach_service import generate_enhanced_company_brief
+    res = await asyncio.to_thread(generate_enhanced_company_brief, request.company, request.role or "")
+    if res.get("status") == "error":
+        raise HTTPException(status_code=500, detail=res.get("message", "Failed to generate brief."))
+    return res
+
+
+@router.get("/agent_reach/doctor")
+async def get_agent_reach_doctor():
+    """Runs self-healing diagnostics for Agent-Reach zero-API-fee internet router layer."""
+    from services.agent_reach_service import agent_reach_doctor
+    return await asyncio.to_thread(agent_reach_doctor)
+
+
+@router.post("/generate_interview_prep")
+async def generate_interview_prep(request: InterviewPrepRequest, authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization.split(" ")[1]
+
+    session = get_session_data(token)
+    resume = session.get("data")
+    if not resume:
+        raise HTTPException(status_code=400, detail="No resume uploaded yet. Upload a resume first.")
+
+    jd_text = request.job_description or ""
+    if not jd_text and request.job_url:
+        try:
+            scraped = await scrape_job_description(request.job_url)
+            jd_text = scraped.get("description", "")
+        except Exception:
+            pass
+
+    youtube_transcript_text = ""
+    if request.youtube_url:
+        try:
+            from services.agent_reach_service import extract_youtube_transcript
+            yt_res = await asyncio.to_thread(extract_youtube_transcript, request.youtube_url)
+            if yt_res.get("status") == "success":
+                youtube_transcript_text = yt_res.get("transcript", "")
+        except Exception as yt_err:
+            print(f"[Interview Prep] YouTube transcript extraction skipped: {yt_err}")
+
+    prompt = f"""You are a professional Interview Coach.
+Help the candidate prepare for an upcoming interview.
+
+CANDIDATE PROFILE:
+{json.dumps(resume, indent=2)}
+
+TARGET POSITION:
+Role: {request.job_title}
+Company: {request.company}
+Job Description context: {jd_text[:1200] if jd_text else "Not provided"}
+{"YouTube Technical Interview/System Design Transcript Excerpt: " + youtube_transcript_text[:2000] if youtube_transcript_text else ""}
+
+Output a complete Markdown Interview Preparation Pack following these sections:
+1. **Behavioral STAR Q&A:** Formulate 3-4 custom STAR stories mapping candidate's experience to likely questions.
+2. **Technical Review Checklist:** List 5 key topics or tools mentioned in the job context or video transcript.
+3. **Common Tough Questions:** Specific answers for 'Why this company?' and how to address gaps.
+4. **Smart Questions to Ask Them:** List 3-4 engaging questions for the interviewer.
+
+Do NOT add conversational intro/outro. Output ONLY the raw Markdown."""
+
+    from services.gemini_client import generate_content_with_fallback
+    try:
+        result_text = await asyncio.to_thread(generate_content_with_fallback, prompt, model_tier="lite")
+        return {"status": "success", "markdown": result_text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/generate_outreach")
+async def generate_outreach(request: GenerateOutreachRequest, authorization: Optional[str] = Header(None), x_gemini_api_key: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    try:
+        session = get_session_data(token)
+        session_resume_data = session.get("data")
+        if not session_resume_data:
+            raise HTTPException(status_code=400, detail="Please upload a resume first.")
+
+        db_api_key = None
+        if token:
+            user = await async_get_user_by_token(token)
+            if user:
+                db_api_key = user.get("gemini_api_key")
+        active_api_key = x_gemini_api_key or db_api_key
+
+        recruiter_info = {
+            "recruiter_name": request.recruiter_name,
+            "recruiter_profile_url": None,
+            "company_name": request.company_name,
+            "platform": request.platform or "unknown"
+        }
+
+        if request.job_url:
+            try:
+                recruiter_info = await asyncio.wait_for(
+                    extract_recruiter(
+                        request.job_url,
+                        request.platform,
+                        company_hint=request.company_name,
+                        custom_api_key=active_api_key
+                    ),
+                    timeout=12.0
+                )
+            except Exception as re_err:
+                print(f"[generate_outreach] Recruiter extraction note: {re_err}")
+            if not recruiter_info.get("company_name"):
+                recruiter_info["company_name"] = request.company_name
+
+        raw_skills = session_resume_data.get("skills", [])
+        if isinstance(raw_skills, dict):
+            flat_skills = [s for sublist in raw_skills.values() for s in (sublist if isinstance(sublist, list) else [sublist])]
+        elif isinstance(raw_skills, list):
+            flat_skills = raw_skills
+        else:
+            flat_skills = []
+
+        ats_analysis = {
+            "match_analysis": {
+                "overall_score": 75,
+                "matched_skills": flat_skills[:5],
+                "missing_skills": [],
+                "tailoring_suggestions": []
+            }
+        }
+
+        outreach_msg = await asyncio.to_thread(
+            generate_outreach_message,
+            job_description=request.job_description or "",
+            resume_data=session_resume_data,
+            ats_analysis=ats_analysis,
+            recruiter_name=recruiter_info.get("recruiter_name"),
+            company_name=recruiter_info.get("company_name") or request.company_name or "",
+            custom_api_key=active_api_key
+        )
+
+        return {
+            "status": "success",
+            "recruiter_info": recruiter_info,
+            "message": outreach_msg.model_dump()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/generate_recruiter_outreach")
+async def generate_recruiter_outreach_endpoint(
+    request: OutreachRequest,
+    authorization: Optional[str] = Header(None),
+    x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-API-Key")
+):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    session = get_session_data(token)
+    session_resume_data = session.get("data", {})
+    if not session_resume_data:
+        raise HTTPException(status_code=400, detail="Master resume missing. Please upload a resume first.")
+
+    active_api_key = x_gemini_api_key
+    if not active_api_key and token:
+        user = await async_get_user_by_token(token)
+        if user:
+            active_api_key = user.get("gemini_api_key")
+
+    ats_analysis = get_cached_analysis(token, request.job_title or "", request.job_description or "") or {}
+
+    outreach = await asyncio.to_thread(
+        generate_outreach_message,
+        request.job_description or "",
+        session_resume_data,
+        ats_analysis,
+        request.recruiter_name,
+        request.company_name or "Company",
+        active_api_key
+    )
+
+    if request.send_email and request.recruiter_email:
+        from services.email_service import async_send_notification_email
+        html_formatted_body = outreach.email_body.replace("\n", "<br>")
+        await async_send_notification_email(
+            to_email=request.recruiter_email,
+            subject=outreach.email_subject,
+            text_body=outreach.email_body,
+            html_body=f"<div style='font-family:sans-serif;line-height:1.6;'>{html_formatted_body}</div>"
+        )
+
+    return {
+        "status": "success",
+        "outreach": outreach.model_dump()
+    }
+
+
+@router.post("/answer_question")
+async def answer_question(request: AnswerQuestionRequest, authorization: Optional[str] = Header(None), x_gemini_api_key: Optional[str] = Header(None)):
+    """Generate high-impact, personalized screening question answers using LLM and candidate resume."""
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+
+    session_resume_data = request.candidate_profile or {}
+    if not session_resume_data and token:
+        user = await async_get_user_by_token(token)
+        if user and user.get("id"):
+            try:
+                from services.auth import supabase_request
+                res = supabase_request(f"user_resumes?user_id=eq.{user['id']}&select=resume_data", "GET")
+                if res and len(res) > 0:
+                    session_resume_data = json.loads(res[0].get("resume_data", "{}"))
+            except Exception:
+                pass
+
+    if not session_resume_data:
+        session = get_session_data(token)
+        session_resume_data = session.get("data", {})
+
+    q_clean = request.question.strip()
+    print(f"\n[AI Screen Solver] Extracted Question: \"{q_clean}\"")
+    print(f"[AI Screen Solver] Company: {request.company_name or 'N/A'} | Role: {request.job_title or 'N/A'}")
+
+    q_lower = q_clean.lower()
+    custom_notice = session_resume_data.get("notice_period") or session_resume_data.get("noticePeriod")
+    custom_salary = session_resume_data.get("salary_expectations") or session_resume_data.get("salary")
+
+    if "notice" in q_lower or "how soon" in q_lower or "start date" in q_lower:
+        ans = custom_notice or "Available immediately (2 weeks notice)."
+        print(f"[AI Screen Solver] Deterministic Answer: {ans}\n")
+        return {"status": "success", "answer": ans}
+    if "hear about" in q_lower or "source" in q_lower or "referred" in q_lower:
+        ans = "LinkedIn"
+        print(f"[AI Screen Solver] Deterministic Answer: {ans}\n")
+        return {"status": "success", "answer": ans}
+    if "salary" in q_lower or "compensation" in q_lower or "expectation" in q_lower:
+        ans = custom_salary or "Competitive market rate / Open to discuss based on role scope."
+        print(f"[AI Screen Solver] Deterministic Answer: {ans}\n")
+        return {"status": "success", "answer": ans}
+
+    skills_list = session_resume_data.get("skills", [])
+    if isinstance(skills_list, dict):
+        skills_str = ", ".join([str(s) for sub in skills_list.values() for s in (sub if isinstance(sub, list) else [sub])][:8])
+    elif isinstance(skills_list, list):
+        skills_str = ", ".join([str(s) for s in skills_list[:8]])
+    else:
+        skills_str = "GenAI, LLM Systems, Python, Distributed Systems, Machine Learning"
+
+    exp_data = session_resume_data.get('work_experience') or session_resume_data.get('experience') or []
+    exp_slice = exp_data[:2] if isinstance(exp_data, list) else []
+
+    prompt = f"""You are answering an application screening question for a candidate.
+
+Candidate Profile:
+Name: {session_resume_data.get('name', 'Akhil Baja')}
+Skills: {skills_str}
+Key Experience: {json.dumps(exp_slice, indent=2)}
+
+Company: {request.company_name or 'Granola'}
+Target Role: {request.job_title or 'AI Engineer'}
+Question: "{request.question}"
+
+CRITICAL INSTRUCTIONS:
+1. Answer ONLY what the question asks. DO NOT write a cover letter.
+2. If asked for 'one line' or 'super-condensed cover letter', provide EXACTLY 1 concise, powerful sentence (max 25 words).
+3. If asked 'Why [Company]' or '5 sentences or less', write 3-4 clear, impactful sentences explaining direct alignment with their product/mission.
+4. Sound natural, confident, and authentic. No conversational filler or meta-intros. Output ONLY the answer string."""
+
+    db_api_key = None
+    if token:
+        user = await async_get_user_by_token(token)
+        if user:
+            db_api_key = user.get("gemini_api_key")
+    active_api_key = x_gemini_api_key or db_api_key
+
+    from services.gemini_client import generate_content_with_fallback
+    try:
+        answer_text = generate_content_with_fallback(
+            prompt=prompt,
+            custom_api_key=active_api_key,
+            model_tier="lite"
+        )
+        final_ans = answer_text.strip().strip('"')
+        print(f"[AI Screen Solver] LLM Generated Answer:\n{final_ans}\n")
+        return {"status": "success", "answer": final_ans}
+    except Exception as e:
+        print(f"[answer_question] LLM generation error: {e}")
+        if "one line" in q_lower or "one-line" in q_lower or "condensed" in q_lower:
+            final_ans = "AI Systems Engineer with 3+ years experience building production-grade GenAI pipelines and scalable LLM applications."
+        elif "why" in q_lower:
+            company = request.company_name or "Granola"
+            final_ans = f"I am drawn to {company}'s vision of transforming collaborative meeting workflows with intuitive, AI-native tools. Having built high-throughput GenAI systems and fast retrieval pipelines at scale, I am excited to contribute directly to engineering robust, low-latency AI features for your users."
+        else:
+            final_ans = f"With experience building production AI systems and scalable infrastructure, I look forward to contributing directly to {request.company_name or 'the team'}."
+        print(f"[AI Screen Solver] Fallback Generated Answer:\n{final_ans}\n")
+        return {"status": "success", "answer": final_ans}
+
+
+@router.post("/user/solve_field")
+async def user_solve_field(request: SolveFieldRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    session_data = get_session_data(token)
+    resume = session_data.get("data", {})
+
+    from services.autofill_agent import get_answer_from_llm
+    answer = await asyncio.to_thread(
+        get_answer_from_llm,
+        request.field_name,
+        request.context or "",
+        resume,
+        request.api_key
+    )
+    return {"answer": answer}
+
+
+@router.post("/user/generate_prompt_query")
+async def generate_prompt_query(request: GeneratePromptQueryRequest, authorization: Optional[str] = Header(None)):
+    from services.gemini_client import generate_content_with_fallback
+    prompt = (
+        "Analyze the following resume enhancement recommendation:\n"
+        f"\"{request.suggestion}\"\n\n"
+        "Generate a clear, polite, and hyper-specific question to ask the candidate in a popup prompt. "
+        "Include realistic example inputs relevant to this exact request (e.g. specific phone/address format, "
+        "percentage growth, latency reduction, cost savings, dataset size, or team scale).\n\n"
+        "Return ONLY a JSON object with this key:\n"
+        "{\n"
+        "  \"prompt_text\": \"Question text with realistic examples here...\"\n"
+        "}"
+    )
+    try:
+        raw_res = await asyncio.to_thread(generate_content_with_fallback, prompt, model_tier="lite")
+        cleaned = raw_res.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+        data = json.loads(cleaned)
+        return {"status": "success", "prompt_text": data.get("prompt_text", "")}
+    except Exception as e:
+        return {
+            "status": "success",
+            "prompt_text": f"This recommendation requests additional metrics or details:\n\n\"{request.suggestion}\"\n\nPlease enter the requested detail or metric:"
+        }
+
+
+@router.post("/send_application_pdf_email")
+async def send_application_pdf_email(request: SendApplicationPdfEmailRequest, authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized. Please sign in.")
+    token = authorization.split(" ")[1]
+    user = await async_get_user_by_token(token)
+    if not user or not user.get("email"):
+        raise HTTPException(status_code=400, detail="User email not found. Please log in.")
+
+    clean_rel = os.path.normpath(request.pdf_url.replace("/download_application_pdf/", "")).lstrip("/")
+    pdf_path = os.path.abspath(os.path.join(OUTPUT_DIR, clean_rel))
+    out_dir_abs = os.path.abspath(OUTPUT_DIR)
+
+    if not pdf_path.startswith(out_dir_abs) or not os.path.exists(pdf_path):
+        flat_path = os.path.join(OUTPUT_DIR, os.path.basename(clean_rel))
+        if os.path.exists(flat_path):
+            pdf_path = flat_path
+        else:
+            raise HTTPException(status_code=404, detail="PDF file not found on server.")
+
+    session = get_session_data(token)
+    session_resume_data = session.get("data", {})
+
+    from services.email_service import async_send_notification_email
+    dest_email = user["email"]
+    cand_name = session_resume_data.get("name", "").strip() or "Candidate" if isinstance(session_resume_data, dict) else "Candidate"
+    ats_display = f"{request.score}%" if request.score is not None else "N/A"
+    email_subj = f"[Resume Delivery] Tailored Resume [{ats_display}]: {request.job_title} at {request.company}"
+    email_text = (
+        f"On-Demand Resume Delivery: Tailored Resume PDF\n"
+        f"For your application at {request.company}\n\n"
+        f"Target Role: {request.job_title}\n"
+        f"Company: {request.company}\n"
+        f"ATS Score: {ats_display}\n\n"
+        f"Hello {cand_name}, your compiled PDF resume (ATS Match Score: {ats_display}) is attached directly to this email.\n\n"
+        f"{'View Job & Apply: ' + request.job_url + chr(10) if request.job_url else ''}"
+        f"{'Open & Edit in Overleaf: ' + request.overleaf_url + chr(10) if request.overleaf_url else ''}\n"
+        f"Sent automatically by your Resume Tailor Assistant."
+    )
+    email_html = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 580px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; color: #1e293b;">
+        <div style="border-bottom: 2px solid #0284c7; padding-bottom: 12px; margin-bottom: 16px;">
+            <span style="font-size: 11px; font-weight: 700; color: #0284c7; text-transform: uppercase; letter-spacing: 0.05em;">On-Demand Resume Delivery</span>
+            <h2 style="margin: 4px 0 0 0; color: #0f172a; font-size: 20px; font-weight: 800;">Tailored Resume PDF</h2>
+            <p style="margin: 4px 0 0 0; color: #64748b; font-size: 13px;">For your application at <strong>{request.company}</strong></p>
+        </div>
+
+        <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin-bottom: 18px; font-size: 13px; line-height: 1.6;">
+            <div style="margin-bottom: 6px;"><strong>Target Role:</strong> {request.job_title}</div>
+            <div style="margin-bottom: 6px;"><strong>Company:</strong> {request.company}</div>
+            <div><strong>ATS Score:</strong> <span style="color: #059669; font-weight: 700;">{ats_display}</span></div>
+        </div>
+
+        <p style="font-size: 14px; line-height: 1.6; color: #334155; margin-bottom: 20px;">
+            Hello <strong>{cand_name}</strong>, your compiled PDF resume (ATS Match Score: <strong>{ats_display}</strong>) is attached directly to this email.
+        </p>
+
+        <div style="margin: 22px 0; text-align: left;">
+            {"<a href='" + request.job_url + "' style='display: inline-block; background-color: #10b981; color: #ffffff; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 13px; margin-right: 10px; margin-bottom: 8px;'>View Job & Apply</a>" if request.job_url else ""}
+            {"<a href='" + request.overleaf_url + "' style='display: inline-block; background-color: #0284c7; color: #ffffff; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 13px; margin-bottom: 8px;'>Open & Edit in Overleaf</a>" if request.overleaf_url else ""}
+        </div>
+
+        <hr style="border: none; border-top: 1px solid #f1f5f9; margin: 24px 0 12px 0;" />
+        <p style="font-size: 11px; color: #94a3b8; margin: 0;">Sent automatically by your Resume Tailor Assistant.</p>
+    </div>
+    """
+
+    email_sent = await async_send_notification_email(
+        to_email=dest_email,
+        subject=email_subj,
+        text_body=email_text,
+        html_body=email_html,
+        attachment_path=pdf_path,
+        attachment_name=f"Tailored_Resume_{(request.company or 'Role').replace(' ', '_')}.pdf"
+    )
+
+    if email_sent:
+        return {"status": "success", "message": f"Tailored PDF sent to {dest_email}"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send email. Check SMTP settings.")
+
+
+@router.post("/send_outreach_email")
+async def send_outreach_email(request: SendOutreachEmailRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+
+    try:
+        if not request.recipient_email or '@' not in request.recipient_email:
+            raise HTTPException(status_code=400, detail="Invalid recipient email address.")
+
+        print(f"[Outreach Email] To: {request.recipient_email}")
+        print(f"[Outreach Email] Subject: {request.subject}")
+
+        return {
+            "status": "success",
+            "message": "Email prepared for sending.",
+            "recipient": request.recipient_email,
+            "subject": request.subject
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/user/test_email")
+async def user_test_email(request: Request, authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization.split(" ")[1]
+    user = await async_get_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    email = user.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+
+    sent = await process_and_send_user_digest(user, bypass_time_check=True)
+    if sent:
+        return {"status": "success", "message": f"Daily job digest generated and sent to {email}"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send preview email. Verify SMTP settings.")

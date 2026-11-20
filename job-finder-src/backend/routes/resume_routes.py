@@ -1,0 +1,959 @@
+import os
+import re
+import json
+import time
+import uuid
+import shutil
+import asyncio
+import subprocess
+import traceback
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Header, UploadFile, File, Response, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from pydantic import BaseModel
+
+from services.session_store import (
+    BASE_DIR,
+    STORAGE_ROOT,
+    UPLOAD_DIR,
+    OUTPUT_DIR,
+    _safe_key,
+    _get_user_storage_dirs,
+    _user_output_paths,
+    _ensure_resume_cls,
+    get_session_data,
+    set_session_data
+)
+from services.auth import async_get_user_by_token
+from services.resume_parser import parse_resume, sanitize_resume_summary
+from utils.latex_utils import generate_latex_from_json, apply_latex_hotfix, compile_and_check_page_metrics, parse_latex_to_resume_dict
+from services.overleaf import upload_zip_to_tmpfiles
+from services.ats_scorer import evaluate_master_resume
+from services.storage_encryption import write_encrypted_file, read_encrypted_file, compile_encrypted_latex
+
+router = APIRouter(tags=["Resume Management"])
+
+MAX_RESUME_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB limit
+
+
+def _get_guest_state_file(token: Optional[str] = None) -> str:
+    key = _safe_key(token)
+    _, user_out_dir = _get_user_storage_dirs(key)
+    return os.path.join(user_out_dir, f"resume_state_{key}.json")
+
+
+def _build_original_latex(resume_data: dict, master_path: Optional[str] = None) -> str:
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    master_template_candidates = [
+        os.path.join(STORAGE_ROOT, "assets", "master_resume_template.tex"),
+        os.path.join(BASE_DIR, "assets", "master_resume_template.tex"),
+        os.path.join(BASE_DIR, "backend", "assets", "master_resume_template.tex"),
+        os.path.join(os.path.dirname(this_dir), "assets", "master_resume_template.tex"),
+        os.path.join(this_dir, "assets", "master_resume_template.tex"),
+        "/app/backend/assets/master_resume_template.tex",
+        "/app/assets/master_resume_template.tex",
+    ]
+    master_template = next((p for p in master_template_candidates if os.path.exists(p) and os.path.isfile(p)), None)
+    master_latex = None
+    if master_path and master_path.endswith(".tex") and os.path.exists(master_path):
+        try:
+            with open(master_path, "r", encoding="utf-8") as f:
+                master_latex = f.read()
+        except Exception:
+            pass
+
+    # If the user has a custom uploaded/saved .tex file, honor it directly!
+    # Do NOT overwrite or wipe custom .tex code by regenerating from JSON.
+    if master_latex and master_latex.strip():
+        return apply_latex_hotfix(master_latex, master_latex=master_latex)
+
+    if master_template and os.path.exists(master_template):
+        try:
+            with open(master_template, "r", encoding="utf-8") as f:
+                master_latex = f.read()
+        except Exception:
+            pass
+
+    # If full structured resume_data is provided and no custom .tex existed, generate pristine LaTeX from JSON
+    if resume_data and (resume_data.get("experience") or resume_data.get("projects") or resume_data.get("education")):
+        return apply_latex_hotfix(generate_latex_from_json(resume_data, master_latex=master_latex), master_latex=master_latex)
+
+    if master_latex:
+        return apply_latex_hotfix(master_latex, master_latex=master_latex)
+
+    return apply_latex_hotfix(generate_latex_from_json(resume_data, master_latex=master_latex), master_latex=master_latex)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pydantic Schemas
+# ─────────────────────────────────────────────────────────────────────────────
+class LatexDownloadRequest(BaseModel):
+    latex_code: str
+
+
+class CoverLetterDownloadRequest(BaseModel):
+    cover_letter: str
+
+
+class CompileLatexRequest(BaseModel):
+    latex_code: str
+
+
+class OverleafRequest(BaseModel):
+    latex_code: str
+    candidate_name: Optional[str] = ""
+    job_title: Optional[str] = ""
+    company: Optional[str] = ""
+
+
+class OriginalOverleafRequest(BaseModel):
+    resume_data: dict
+    job_title: Optional[str] = ""
+    company: Optional[str] = ""
+
+
+class GeneratePromptQueryRequest(BaseModel):
+    suggestion: str
+
+
+class ApplySuggestionRequest(BaseModel):
+    suggestion: str
+    user_input: Optional[str] = None
+
+
+class UpdateMasterFromTailoredRequest(BaseModel):
+    latex_code: str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resume Routes
+# ─────────────────────────────────────────────────────────────────────────────
+@router.post("/upload_resume")
+async def upload_resume(file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+
+    try:
+        raw_filename = os.path.basename(file.filename or "resume_upload")
+        safe_filename = re.sub(r'[^A-Za-z0-9._-]', '_', raw_filename).lstrip('.')
+        if not safe_filename:
+            safe_filename = f"resume_upload_{uuid.uuid4().hex[:8]}"
+        user_up_dir, user_out_dir = _get_user_storage_dirs(token or "guest")
+        file_path = os.path.join(user_up_dir, safe_filename)
+
+        total_written = 0
+        with open(file_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                total_written += len(chunk)
+                if total_written > MAX_RESUME_UPLOAD_BYTES:
+                    buffer.close()
+                    os.remove(file_path)
+                    raise HTTPException(status_code=413, detail=f"Resume file exceeds {MAX_RESUME_UPLOAD_BYTES // (1024*1024)}MB upload limit.")
+                buffer.write(chunk)
+
+        structured_data = await asyncio.to_thread(parse_resume, file_path)
+        data = structured_data.model_dump()
+        path = file_path
+
+        if not file_path.endswith(".tex"):
+            canonical_tex_path = os.path.join(user_up_dir, f"{uuid.uuid4().hex}_master.tex")
+            canonical_tex = generate_latex_from_json(data)
+            with open(canonical_tex_path, "w", encoding="utf-8") as f:
+                f.write(canonical_tex)
+            path = canonical_tex_path
+
+        # Baseline PDF Compilation
+        try:
+            _ensure_resume_cls(user_up_dir)
+            _ensure_resume_cls(user_out_dir)
+            _ensure_resume_cls(OUTPUT_DIR)
+
+            with open(path, "r", encoding="utf-8") as _f:
+                canonical_tex_content = _f.read()
+
+            if file_path.endswith(".tex"):
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tectonic", path, "--outdir", user_out_dir],
+                    cwd=user_out_dir,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+            else:
+                pages, _ = await asyncio.to_thread(compile_and_check_page_metrics, canonical_tex_content, 1.0, 1.0, None)
+                opt_scale = 1.0
+                opt_ls = 1.0
+                if pages > 1:
+                    for ls in [0.95, 0.91, 0.88, 0.82, 0.78]:
+                        p, _ = await asyncio.to_thread(compile_and_check_page_metrics, canonical_tex_content, 1.0, ls, None)
+                        if p == 1:
+                            opt_ls = ls
+                            pages = 1
+                            break
+                if pages > 1:
+                    for scale in [0.85, 0.75, 0.65]:
+                        p, _ = await asyncio.to_thread(compile_and_check_page_metrics, canonical_tex_content, scale, opt_ls, None)
+                        if p == 1:
+                            opt_scale = scale
+                            break
+
+                fixed_baseline_tex = apply_latex_hotfix(canonical_tex_content, opt_scale, opt_ls, None)
+                with open(path, "w", encoding="utf-8") as _f:
+                    _f.write(fixed_baseline_tex)
+
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tectonic", path, "--outdir", user_out_dir],
+                    cwd=user_out_dir,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+        except Exception as baseline_err:
+            print(f"[upload_resume] Baseline PDF compilation warning: {baseline_err}")
+
+        evaluation = evaluate_master_resume(data)
+        set_session_data(token, data, path)
+
+        guest_file = _get_guest_state_file(token)
+        try:
+            state_payload = json.dumps({"data": data, "path": path, "evaluation": evaluation}, indent=2)
+            write_encrypted_file(guest_file, state_payload, token)
+        except Exception as file_err:
+            print(f"[upload_resume] Could not save encrypted state file {guest_file}: {file_err}")
+
+        # Automatically sync parsed resume into candidate_profile.json
+        try:
+            from job_finder_mcp.tools.profile_tools import sync_resume_data_to_profile
+            sync_resume_data_to_profile(data)
+        except Exception as sync_err:
+            print(f"[upload_resume] Note: Could not auto-sync to candidate_profile.json: {sync_err}")
+
+        return {
+            "message": "Resume uploaded and parsed successfully",
+            "data": data,
+            "evaluation": evaluation
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/get_session_resume")
+async def get_session_resume(authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+
+    session_info = get_session_data(token)
+    data = session_info.get("data", {})
+    if not data or not data.get("education"):
+        user_guest_file = _get_guest_state_file(token)
+        try:
+            raw_state = read_encrypted_file(user_guest_file, token)
+            saved = json.loads(raw_state.decode("utf-8"))
+            data = saved.get("data", {})
+            set_session_data(token, data, saved.get("path", ""))
+        except Exception as e:
+            if not isinstance(e, FileNotFoundError):
+                print(f"[get_session_resume] Note on reading state file: {e}")
+
+    if data and isinstance(data, dict) and "summary" in data:
+        data["summary"] = sanitize_resume_summary(data["summary"])
+
+    master_latex = ""
+    master_path = session_info.get("path", "")
+    if master_path:
+        try:
+            raw_master = read_encrypted_file(master_path, token)
+            master_latex = raw_master.decode("utf-8")
+        except Exception:
+            if os.path.exists(master_path):
+                try:
+                    with open(master_path, "r", encoding="utf-8") as f:
+                        master_latex = f.read()
+                except Exception:
+                    pass
+
+    return {
+        "status": "success",
+        "data": data,
+        "path": master_path,
+        "master_latex": master_latex
+    }
+
+
+@router.get("/user/resume")
+async def user_resume(authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    session = get_session_data(token)
+    data = session.get("data")
+    if data and isinstance(data, dict) and "summary" in data:
+        data["summary"] = sanitize_resume_summary(data["summary"])
+    eval_res = evaluate_master_resume(data) if data else None
+
+    master_latex = ""
+    master_path = session.get("path", "")
+    if master_path and os.path.exists(master_path):
+        try:
+            with open(master_path, "r", encoding="utf-8") as f:
+                master_latex = f.read()
+        except Exception:
+            pass
+
+    return {
+        "data": data,
+        "path": master_path,
+        "master_latex": master_latex,
+        "evaluation": eval_res
+    }
+
+
+@router.post("/download_latex")
+async def download_latex(request: LatexDownloadRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    try:
+        tex_path, _ = _user_output_paths(token)
+        fixed_code = apply_latex_hotfix(request.latex_code)
+        with open(tex_path, "w", encoding="utf-8") as f:
+            f.write(fixed_code)
+        return FileResponse(tex_path, media_type="text/plain", filename="resume.tex")
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/download_application_pdf/{filepath:path}")
+async def download_application_pdf(filepath: str):
+    from services.session_store import USER_DATA_DIR
+    clean_rel = os.path.normpath(filepath).lstrip("/")
+    parts = clean_rel.split(os.sep)
+
+    candidate_paths = [
+        os.path.abspath(os.path.join(OUTPUT_DIR, clean_rel)),
+        os.path.abspath(os.path.join(OUTPUT_DIR, os.path.basename(clean_rel))),
+        os.path.abspath(os.path.join(OUTPUT_DIR, f"{clean_rel}.enc")),
+        os.path.abspath(os.path.join(OUTPUT_DIR, f"{os.path.basename(clean_rel)}.enc")),
+    ]
+
+    user_token_or_id = None
+    if len(parts) >= 2:
+        user_key = parts[0]
+        user_token_or_id = user_key
+        filename = os.path.join(*parts[1:])
+        candidate_paths.append(os.path.abspath(os.path.join(USER_DATA_DIR, user_key, "output", filename)))
+        candidate_paths.append(os.path.abspath(os.path.join(USER_DATA_DIR, user_key, "output", os.path.basename(filename))))
+        candidate_paths.append(os.path.abspath(os.path.join(USER_DATA_DIR, user_key, "output", f"{filename}.enc")))
+        candidate_paths.append(os.path.abspath(os.path.join(USER_DATA_DIR, user_key, "output", f"{os.path.basename(filename)}.enc")))
+    elif len(parts) == 1 and os.path.exists(USER_DATA_DIR):
+        filename = parts[0]
+        for root, _, files in os.walk(USER_DATA_DIR):
+            if filename in files or f"{filename}.enc" in files:
+                target_f = filename if filename in files else f"{filename}.enc"
+                candidate_paths.append(os.path.abspath(os.path.join(root, target_f)))
+                # Extract user_id from path if possible
+                rel = os.path.relpath(root, USER_DATA_DIR).split(os.sep)
+                if rel:
+                    user_token_or_id = rel[0]
+                break
+
+    pdf_path = None
+    for p in candidate_paths:
+        if os.path.exists(p) and os.path.isfile(p):
+            pdf_path = p
+            break
+
+    if not pdf_path:
+        raise HTTPException(status_code=404, detail="PDF file not found")
+
+    filename = os.path.basename(pdf_path).replace(".enc", "")
+    if pdf_path.endswith(".enc"):
+        try:
+            decrypted_bytes = read_encrypted_file(pdf_path, user_token_or_id)
+            return Response(
+                content=decrypted_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"inline; filename={filename}"}
+            )
+        except Exception as dec_err:
+            print(f"[download_application_pdf] Decryption error: {dec_err}")
+            raise HTTPException(status_code=403, detail="Unable to decrypt PDF with session authorization.")
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={filename}"}
+    )
+
+
+@router.post("/download_cover_letter")
+async def download_cover_letter(request: CoverLetterDownloadRequest):
+    return Response(
+        content=request.cover_letter,
+        media_type="text/plain",
+        headers={"Content-Disposition": "attachment; filename=cover_letter.txt"}
+    )
+
+
+@router.post("/compile_latex")
+async def compile_latex(request: CompileLatexRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    try:
+        user_up_dir, user_out_dir = _get_user_storage_dirs(token or "guest")
+        fixed_code = apply_latex_hotfix(request.latex_code)
+        key = _safe_key(token)
+        base_filename = f"tailored_resume_{key}"
+
+        try:
+            pdf_bytes, page_count = await asyncio.to_thread(
+                compile_encrypted_latex,
+                fixed_code,
+                user_out_dir,
+                base_filename,
+                token
+            )
+        except RuntimeError as comp_err:
+            raise HTTPException(status_code=400, detail=str(comp_err))
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=503,
+                detail="Tectonic XeLaTeX engine is not installed on this system. Please install tectonic to compile LaTeX resumes."
+            )
+
+        # Fast deterministic ATS evaluation for Live Preview HUD
+        ats_score = 85
+        skills_count = 0
+        quant_percent = 0
+        try:
+            parsed_resume_dict = parse_latex_to_resume_dict(fixed_code)
+            eval_dict = evaluate_master_resume(parsed_resume_dict)
+            ats_score = int(eval_dict.get("ats_score", 85))
+            skills_count = int(eval_dict.get("skills_count", 0))
+            quant_percent = int(eval_dict.get("quantified_percentage", 0))
+        except Exception as eval_err:
+            print(f"[compile_latex] Live ATS evaluation error: {eval_err}")
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": "inline; filename=resume.pdf",
+                "X-Page-Count": str(page_count),
+                "X-ATS-Score": str(ats_score),
+                "X-ATS-Skills-Count": str(skills_count),
+                "X-ATS-Quant-Percent": str(quant_percent),
+                "Access-Control-Expose-Headers": "X-Page-Count, X-ATS-Score, X-ATS-Skills-Count, X-ATS-Quant-Percent"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/open_in_overleaf")
+async def open_in_overleaf(request: OverleafRequest):
+    try:
+        url = await asyncio.to_thread(
+            upload_zip_to_tmpfiles,
+            request.latex_code,
+            request.candidate_name or "",
+            request.job_title or "",
+            request.company or ""
+        )
+        return {"url": url}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/open_original_in_overleaf")
+async def open_original_in_overleaf(request: OriginalOverleafRequest):
+    try:
+        session = get_session_data(None)
+        master_path = session.get("path") if session else None
+        latex_code = _build_original_latex(request.resume_data, master_path)
+        candidate_name = request.resume_data.get("name", "") or ""
+        url = await asyncio.to_thread(
+            upload_zip_to_tmpfiles,
+            latex_code,
+            candidate_name,
+            request.job_title or "",
+            request.company or ""
+        )
+        return {"url": url}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/compile_master_pdf")
+async def compile_master_pdf(request: OriginalOverleafRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    try:
+        session = get_session_data(token)
+        master_path = session.get("path") if session else None
+        latex_code = _build_original_latex(request.resume_data, master_path)
+        candidate_name = request.resume_data.get("name", "Master")
+        safe_name = _safe_key(candidate_name)
+        user_out_dir = os.path.join(OUTPUT_DIR, safe_name)
+        os.makedirs(user_out_dir, exist_ok=True)
+
+        _ensure_resume_cls(user_out_dir)
+        _ensure_resume_cls(OUTPUT_DIR)
+
+        pages, _ = await asyncio.to_thread(compile_and_check_page_metrics, latex_code, 1.0, 1.0, None)
+        opt_scale = 1.0
+        opt_ls = 1.0
+        if pages > 1:
+            for ls in [0.95, 0.91, 0.88, 0.82, 0.78]:
+                p, _ = await asyncio.to_thread(compile_and_check_page_metrics, latex_code, 1.0, ls, None)
+                if p == 1:
+                    opt_ls = ls
+                    pages = 1
+                    break
+        if pages > 1:
+            for scale in [0.85, 0.75, 0.65]:
+                p, _ = await asyncio.to_thread(compile_and_check_page_metrics, latex_code, scale, opt_ls, None)
+                if p == 1:
+                    opt_scale = scale
+                    break
+
+        final_latex = apply_latex_hotfix(latex_code, opt_scale, opt_ls, None)
+
+        try:
+            pdf_bytes, page_count = await asyncio.to_thread(
+                compile_encrypted_latex,
+                final_latex,
+                user_out_dir,
+                "master_resume",
+                token or safe_name
+            )
+        except RuntimeError as comp_err:
+            raise HTTPException(status_code=400, detail=str(comp_err))
+
+        download_url = f"/download_application_pdf/{safe_name}/master_resume.pdf"
+        return {"status": "success", "pdf_url": download_url, "latex": final_latex}
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/user/apply_suggestion")
+async def apply_suggestion(request: ApplySuggestionRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    session = get_session_data(token)
+    data = session.get("data")
+    if not data:
+        raise HTTPException(status_code=400, detail="No master resume uploaded.")
+
+    from services.gemini_client import generate_content_with_fallback
+    user_context = f"\nUser provided metric / context: {request.user_input}\n" if request.user_input else ""
+    prompt = (
+        "Update the master resume JSON by integrating this specific recommendation:\n"
+        f"Recommendation: {request.suggestion}{user_context}\n\n"
+        "CRITICAL RULE: Do NOT hallucinate metrics, financial numbers, or percentages. "
+        "Use ONLY exact numbers provided by the user context above or refine the wording accurately.\n\n"
+        f"Master Resume JSON:\n{json.dumps(data, indent=2)}\n\n"
+        "Return ONLY the updated valid JSON object representing StructuredResume."
+    )
+    res_text = generate_content_with_fallback(prompt=prompt, system_instruction="Output ONLY raw JSON.")
+    try:
+        cleaned = res_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+        updated_data = json.loads(cleaned)
+
+        user_up_dir, user_out_dir = _get_user_storage_dirs(token or "guest")
+        canonical_tex_path = os.path.join(user_up_dir, f"{uuid.uuid4().hex}_master.tex")
+        canonical_tex = generate_latex_from_json(updated_data)
+        with open(canonical_tex_path, "w", encoding="utf-8") as f:
+            f.write(canonical_tex)
+
+        _ensure_resume_cls(user_up_dir)
+        _ensure_resume_cls(user_out_dir)
+        _ensure_resume_cls(OUTPUT_DIR)
+
+        after_pdf_filename = f"master_after_{uuid.uuid4().hex[:8]}.pdf"
+        after_pdf_path = os.path.join(user_out_dir, after_pdf_filename)
+
+        pages, _ = await asyncio.to_thread(compile_and_check_page_metrics, canonical_tex, 1.0, 1.0, None)
+        optimal_scale = 1.0
+        optimal_linespread = 1.0
+        if pages > 1:
+            for ls in [0.95, 0.91, 0.88, 0.82, 0.78]:
+                p, _ = await asyncio.to_thread(compile_and_check_page_metrics, canonical_tex, 1.0, ls, None)
+                if p == 1:
+                    pages = 1
+                    optimal_linespread = ls
+                    break
+
+        if pages > 1:
+            for scale in [0.85, 0.75, 0.65]:
+                p, _ = await asyncio.to_thread(compile_and_check_page_metrics, canonical_tex, scale, optimal_linespread, None)
+                if p == 1:
+                    pages = 1
+                    optimal_scale = scale
+                    break
+
+        final_fixed_tex = apply_latex_hotfix(canonical_tex, optimal_scale, optimal_linespread, None)
+        with open(canonical_tex_path, "w", encoding="utf-8") as f:
+            f.write(final_fixed_tex)
+
+        _ensure_resume_cls(user_out_dir)
+        _ensure_resume_cls(OUTPUT_DIR)
+
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tectonic", canonical_tex_path, "--outdir", user_out_dir],
+            cwd=user_out_dir,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+
+        default_after_pdf = os.path.join(user_out_dir, os.path.basename(canonical_tex_path).replace(".tex", ".pdf"))
+        if os.path.exists(default_after_pdf):
+            os.replace(default_after_pdf, after_pdf_path)
+
+        after_pdf_url = f"/download_application_pdf/{_safe_key(token or 'guest')}/{after_pdf_filename}" if os.path.exists(after_pdf_path) else None
+
+        set_session_data(token, updated_data, canonical_tex_path)
+        guest_file = _get_guest_state_file(token)
+        new_eval = evaluate_master_resume(updated_data)
+        try:
+            state_payload = json.dumps({"data": updated_data, "path": canonical_tex_path, "evaluation": new_eval}, indent=2)
+            write_encrypted_file(guest_file, state_payload, token)
+        except Exception:
+            pass
+
+        return {
+            "status": "success",
+            "data": updated_data,
+            "evaluation": new_eval,
+            "latex": canonical_tex,
+            "after_pdf_url": after_pdf_url
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to apply suggestion: {str(e)}")
+
+
+@router.post("/user/update_master_from_tailored")
+async def update_master_from_tailored(request: UpdateMasterFromTailoredRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    if not request.latex_code or not request.latex_code.strip():
+        raise HTTPException(status_code=400, detail="Invalid LaTeX content.")
+
+    try:
+        user_up_dir, _ = _get_user_storage_dirs(token or "guest")
+        temp_tex = os.path.join(user_up_dir, f"temp_promoted_{uuid.uuid4().hex[:8]}.tex")
+        with open(temp_tex, "w", encoding="utf-8") as f:
+            f.write(request.latex_code)
+
+        structured = await asyncio.to_thread(parse_resume, temp_tex)
+        updated_data = structured.model_dump()
+
+        canonical_tex_path = os.path.join(user_up_dir, f"{uuid.uuid4().hex}_master.tex")
+        with open(canonical_tex_path, "w", encoding="utf-8") as f:
+            f.write(request.latex_code)
+
+        set_session_data(token, updated_data, canonical_tex_path)
+        guest_file = _get_guest_state_file(token)
+        new_eval = evaluate_master_resume(updated_data)
+        try:
+            state_payload = json.dumps({"data": updated_data, "path": canonical_tex_path, "evaluation": new_eval}, indent=2)
+            write_encrypted_file(guest_file, state_payload, token)
+        except Exception:
+            pass
+
+        return {"status": "success", "message": "Master resume updated from tailored version!", "data": updated_data, "evaluation": new_eval}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update master resume: {str(e)}")
+
+
+@router.get("/render_html_resume")
+async def render_html_resume_endpoint(authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    session = get_session_data(token)
+    session_resume = session.get("data") or {}
+
+    from services.html_resume_renderer import render_html_resume
+    html_content = render_html_resume(session_resume)
+    return HTMLResponse(content=html_content, status_code=200)
+
+
+@router.get("/download_extension")
+async def download_extension(
+    request: Request,
+    token: Optional[str] = None,
+    key: Optional[str] = None,
+    authorization: Optional[str] = Header(None)
+):
+    import io
+    import zipfile
+    auth_token = key or token or (authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None)
+    user = await async_get_user_by_token(auth_token) if auth_token else None
+
+    sync_code = ""
+    if user and user.get("sync_code"):
+        sync_code = str(user["sync_code"]).strip().upper()
+    elif auth_token and len(auth_token.strip()) == 6 and auth_token.strip().isalnum():
+        sync_code = auth_token.strip().upper()
+    elif auth_token and auth_token.startswith("guest-"):
+        sync_code = auth_token.replace("guest-", "")[:6].upper()
+
+    proto = request.headers.get("x-forwarded-proto", "https")
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "www.job-finder.space")
+    server_url = f"{proto}://{host}" if host else "https://www.job-finder.space"
+
+    this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    ext_candidates = [
+        os.path.abspath(os.path.join(BASE_DIR, "extension")),
+        os.path.abspath(os.path.join(BASE_DIR, "../extension")),
+        os.path.abspath(os.path.join(this_file_dir, "../../extension")),
+        os.path.abspath(os.path.join(this_file_dir, "../extension")),
+        "/app/extension",
+    ]
+    ext_dir = next((d for d in ext_candidates if os.path.isdir(d)), ext_candidates[0])
+    zip_buffer = io.BytesIO()
+
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(ext_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["__pycache__", "node_modules"]]
+            for file in files:
+                if not file.startswith("."):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, ext_dir)
+                    if file == "popup.js":
+                        with open(full_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        content = content.replace(
+                            'const DEFAULT_API_BASE_URL = "https://www.job-finder.space";',
+                            f'const DEFAULT_API_BASE_URL = "{server_url}";'
+                        ).replace(
+                            'const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";',
+                            f'const DEFAULT_API_BASE_URL = "{server_url}";'
+                        )
+                        content = content.replace(
+                            'const DEFAULT_SYNC_KEY = "";',
+                            f'const DEFAULT_SYNC_KEY = "{sync_code}";'
+                        ).replace(
+                            'const DEFAULT_SYNC_KEY = "GABY48";',
+                            f'const DEFAULT_SYNC_KEY = "{sync_code}";'
+                        )
+                        zipf.writestr(rel_path, content)
+                    else:
+                        zipf.write(full_path, rel_path)
+
+    zip_buffer.seek(0)
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="job_finder_extension.zip"'}
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Archetype Master Resume Management
+# ─────────────────────────────────────────────────────────────────────────────
+class SaveArchetypeRequest(BaseModel):
+    archetype_name: str
+    latex_code: Optional[str] = None
+
+class SwitchArchetypeRequest(BaseModel):
+    archetype_name: str
+
+class DeleteArchetypeRequest(BaseModel):
+    archetype_name: str
+
+
+def _get_archetype_manifest_path(token: Optional[str]) -> str:
+    user_up_dir, _ = _get_user_storage_dirs(token or "guest")
+    return os.path.join(user_up_dir, "archetypes_manifest.json")
+
+
+@router.get("/user/archetypes")
+async def get_user_archetypes(authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    manifest_path = _get_archetype_manifest_path(token)
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+                return {"status": "success", "archetypes": manifest.get("archetypes", []), "active_archetype": manifest.get("active_archetype", "Primary")}
+        except Exception:
+            pass
+    return {
+        "status": "success",
+        "archetypes": [{"name": "Primary", "description": "Default Master Profile", "skills_count": 0, "is_active": True}],
+        "active_archetype": "Primary"
+    }
+
+
+@router.post("/user/archetypes/save")
+async def save_user_archetype(request: SaveArchetypeRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    name = request.archetype_name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Archetype name cannot be empty.")
+
+    session = get_session_data(token)
+    session_data = session.get("data") or {}
+    session_tex_path = session.get("path") or session.get("latex_path")
+
+    user_up_dir, _ = _get_user_storage_dirs(token or "guest")
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    arch_tex_path = os.path.join(user_up_dir, f"archetype_{safe_name}.tex")
+    arch_data_path = os.path.join(user_up_dir, f"archetype_{safe_name}.json")
+
+    latex_to_save = request.latex_code
+    if not latex_to_save and session_tex_path and os.path.exists(session_tex_path):
+        try:
+            with open(session_tex_path, "r", encoding="utf-8") as f:
+                latex_to_save = f.read()
+        except Exception:
+            pass
+
+    if latex_to_save:
+        with open(arch_tex_path, "w", encoding="utf-8") as f:
+            f.write(latex_to_save)
+
+    with open(arch_data_path, "w", encoding="utf-8") as f:
+        json.dump(session_data, f, indent=2)
+
+    # Update manifest
+    manifest_path = _get_archetype_manifest_path(token)
+    manifest: dict = {"archetypes": [], "active_archetype": name}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                loaded_manifest = json.load(f)
+                if isinstance(loaded_manifest, dict):
+                    manifest = loaded_manifest
+        except Exception:
+            pass
+
+    existing_archetypes = manifest.get("archetypes", [])
+    archetypes: list[dict] = [a for a in existing_archetypes if isinstance(a, dict) and a.get("name") != name]
+    eval_res = evaluate_master_resume(session_data) if session_data else {"skills_count": 0, "ats_score": 85}
+    archetypes.append({
+        "name": name,
+        "skills_count": eval_res.get("skills_count", 0),
+        "ats_score": eval_res.get("ats_score", 85),
+        "is_active": True,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M")
+    })
+    for a in archetypes:
+        if isinstance(a, dict):
+            a["is_active"] = (a.get("name") == name)
+
+    manifest["archetypes"] = archetypes
+    manifest["active_archetype"] = name
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    return {"status": "success", "message": f"Archetype '{name}' saved successfully!", "archetypes": archetypes, "active_archetype": name}
+
+
+@router.post("/user/archetypes/switch")
+async def switch_user_archetype(request: SwitchArchetypeRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    name = request.archetype_name.strip()
+    user_up_dir, _ = _get_user_storage_dirs(token or "guest")
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    arch_tex_path = os.path.join(user_up_dir, f"archetype_{safe_name}.tex")
+    arch_data_path = os.path.join(user_up_dir, f"archetype_{safe_name}.json")
+
+    if not os.path.exists(arch_data_path):
+        raise HTTPException(status_code=404, detail=f"Archetype '{name}' not found.")
+
+    with open(arch_data_path, "r", encoding="utf-8") as f:
+        loaded_data = json.load(f)
+
+    session_tex = arch_tex_path if os.path.exists(arch_tex_path) else ""
+    set_session_data(token, loaded_data, session_tex)
+    guest_file = _get_guest_state_file(token)
+    new_eval = evaluate_master_resume(loaded_data)
+    try:
+        with open(guest_file, "w") as f:
+            json.dump({"data": loaded_data, "path": session_tex, "evaluation": new_eval}, f, indent=2)
+    except Exception:
+        pass
+
+    # Update manifest active status
+    manifest_path = _get_archetype_manifest_path(token)
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            if isinstance(manifest_data, dict):
+                for a in manifest_data.get("archetypes", []):
+                    if isinstance(a, dict):
+                        a["is_active"] = (a.get("name") == name)
+                manifest_data["active_archetype"] = name
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    json.dump(manifest_data, f, indent=2)
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "active_archetype": name,
+        "data": loaded_data,
+        "evaluation": new_eval
+    }
+
+
+@router.post("/user/archetypes/delete")
+async def delete_user_archetype(request: DeleteArchetypeRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.split(" ")[1] if authorization and authorization.startswith("Bearer ") else None
+    name = request.archetype_name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Archetype name cannot be empty.")
+
+    user_up_dir, _ = _get_user_storage_dirs(token or "guest")
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    arch_tex_path = os.path.join(user_up_dir, f"archetype_{safe_name}.tex")
+    arch_data_path = os.path.join(user_up_dir, f"archetype_{safe_name}.json")
+
+    # Delete physical archetype files if present
+    if os.path.exists(arch_tex_path):
+        try: os.remove(arch_tex_path)
+        except Exception: pass
+    if os.path.exists(arch_data_path):
+        try: os.remove(arch_data_path)
+        except Exception: pass
+
+    # Update manifest
+    manifest_path = _get_archetype_manifest_path(token)
+    remaining_archetypes = []
+    active_name = "Primary"
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            if isinstance(manifest_data, dict):
+                existing = manifest_data.get("archetypes", [])
+                remaining_archetypes = [a for a in existing if isinstance(a, dict) and a.get("name") != name]
+                if manifest_data.get("active_archetype") == name:
+                    active_name = remaining_archetypes[0]["name"] if remaining_archetypes else "Primary"
+                else:
+                    active_name = manifest_data.get("active_archetype", "Primary")
+                
+                manifest_data["archetypes"] = remaining_archetypes
+                manifest_data["active_archetype"] = active_name
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    json.dump(manifest_data, f, indent=2)
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "message": f"Archetype '{name}' deleted successfully.",
+        "archetypes": remaining_archetypes,
+        "active_archetype": active_name
+    }
+

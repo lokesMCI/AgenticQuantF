@@ -1,0 +1,1922 @@
+import os
+import json
+import urllib.parse
+import urllib.request
+import re
+import asyncio
+import hashlib
+import inspect
+from datetime import datetime, timezone
+# pyrefly: ignore [missing-import]
+from bs4 import BeautifulSoup
+from typing import List, Optional, Dict, Any
+# pyrefly: ignore [missing-import]
+from pydantic import BaseModel, Field
+# pyrefly: ignore [missing-import]
+from google import genai
+# pyrefly: ignore [missing-import]
+from google.genai import types
+# pyrefly: ignore [missing-import]
+from services.gemini_client import generate_content_with_fallback
+# pyrefly: ignore [missing-import]
+from services.ats_scorer import (
+    compute_ats_score, compute_overall_score, calculate_flattened_experience,
+    estimate_role_fit_score, _extract_taxonomy_skills, get_candidate_seniority_tier,
+    _COMPILED_TITLE_TIER_PATTERNS
+)
+# pyrefly: ignore [missing-import]
+from services.scraper import scrape_job_description
+# pyrefly: ignore [missing-import]
+from services.recruiter_extractor import extract_recruiter
+# pyrefly: ignore [missing-import]
+from utils.ssl_utils import SSL_CONTEXT
+# pyrefly: ignore [missing-import]
+from utils.ttl_cache import TTLCache
+# pyrefly: ignore [missing-import]
+from utils.location_resolver import get_indeed_domain_for_location, resolve_location_country
+# pyrefly: ignore [missing-import]
+from services.log_queue import LLMClientLogQueue, log_ist
+
+# ─── System Caps & TTL Cache ─────────────────────────────────────────────
+def _is_cloud_environment() -> bool:
+    """Detects whether running in a cloud/production container (Render, Hugging Face, Railway, Fly)."""
+    return any(os.getenv(v) for v in ("RENDER", "RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "FLY_APP_NAME", "SPACE_ID", "HF_SPACE_ID")) or os.getenv("ENVIRONMENT") == "production"
+
+# In production / cloud instances: keep conservative limits (15 total, ~8 per platform) to avoid memory/rate limits
+# In local development: process up to 50 LinkedIn + 50 Indeed jobs
+if _is_cloud_environment():
+    DISCOVERY_JD_FETCH_CAP = 15
+    DISCOVERY_PLATFORM_FETCH_CAP = 8
+else:
+    DISCOVERY_JD_FETCH_CAP = 100
+    DISCOVERY_PLATFORM_FETCH_CAP = 50
+
+DISCOVERY_FETCH_CONCURRENCY = 5  # Scaled up to 5 concurrent browser tasks utilizing 3GB combined memory
+_job_search_cache = TTLCache(ttl_seconds=300)  # 5-minute TTL search cache
+_indeed_blocked_circuit_breaker = False        # Flips to True if 1 Indeed request gets Cloudflare blocked
+
+# ─── Pydantic Schemas for Search ──────────────────────────────────────────
+
+class SearchQueries(BaseModel):
+    queries: List[str] = Field(
+        description="3-5 optimized job search keywords (e.g. ['Machine Learning Engineer', 'Generative AI Engineer'])"
+    )
+
+class JobSearchResult(BaseModel):
+    title: str
+    company: str
+    location: str
+    url: str
+    platform: str
+    post_date_raw: str
+    job_id: str
+    full_description: Optional[str] = None
+
+# ─── Query Generation from Resume ─────────────────────────────────────────
+
+def generate_search_queries_from_resume(resume_data: dict, custom_api_key: Optional[str] = None) -> List[str]:
+    """Uses Gemini to extract 3-5 optimized search queries based on the candidate's skills and roles."""
+    skills = resume_data.get("skills", [])
+    recent_roles = [exp.get("role", "") for exp in resume_data.get("experience", [])[:2]]
+    
+    prompt = f"""Given the candidate skills and recent job roles, generate 3-5 high-converting job search queries (keywords) for hiring search engines.
+    Cover the candidate's own field and closely related job titles so similar listings are discovered.
+    
+    Skills: {', '.join(skills)}
+    Recent Roles: {', '.join(recent_roles)}
+    
+    Respond with the JSON format matching the schema. Keep queries clean (no quotation marks, e.g. \"Generative AI Engineer\").
+    """
+    try:
+        response = generate_content_with_fallback(prompt, SearchQueries, custom_api_key)
+        res = json.loads(response)
+        return res.get("queries", [recent_roles[0]] if recent_roles else ["Software Engineer"])
+    except Exception as e:
+        print(f"[Job Searcher] Failed to generate queries: {e}")
+        # Default fallbacks
+        return [recent_roles[0]] if recent_roles else ["Software Engineer"]
+
+
+# ─── Timeframe Normalizer ──────────────────────────────────────────────
+
+def normalize_timeframe(timeframe: Optional[str]) -> str:
+    """
+    Normalizes human/config timeframe strings to standardized search keys:
+    '24h', '48h', '1w', '1m', or 'all'.
+    """
+    if not timeframe:
+        return "48h"
+    t = timeframe.strip().lower().replace(" ", "_").replace("-", "_")
+    if t in ("24h", "24", "1d", "day", "past_24_hours", "past_24h", "past_1_day", "last_24_hours", "24_hours"):
+        return "24h"
+    if t in ("48h", "48", "2d", "past_48_hours", "past_48h", "past_2_days", "last_48_hours", "48_hours"):
+        return "48h"
+    if t in ("1w", "7d", "week", "past_week", "past_7_days", "last_week", "1_week"):
+        return "1w"
+    if t in ("1m", "30d", "month", "past_month", "past_30_days", "last_month", "1_month"):
+        return "1m"
+    if t in ("all", "any"):
+        return "all"
+    return "48h"
+
+
+# ─── Direct ATS Job Search with Gemini Google Search Grounding ─────────────
+
+_ats_grounding_quota_exhausted = False
+
+def search_direct_ats_jobs(
+    role: str,
+    location: str = "London",
+    timeframe: str = "48h",
+    api_key: Optional[str] = None
+) -> List[JobSearchResult]:
+    global _ats_grounding_quota_exhausted
+    if _ats_grounding_quota_exhausted:
+        return []
+
+    gemini_key = api_key or os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        return []
+
+    tf_norm = normalize_timeframe(timeframe)
+
+    # Map timeframe
+    freshness_prompt = {
+        "24h": "posted in the last 24 hours (strictly within the past 1 day)",
+        "48h": "posted in the last 48 hours (strictly within the past 2 days)",
+        "1w": "posted within the last 7 days",
+        "1m": "posted within the last 30 days"
+    }.get(tf_norm, "posted recently")
+
+    prompt = f"""Use Google Search to find 5 to 10 active, open job postings for '{role}' in '{location}' that are hosted on direct ATS career portals (Greenhouse, Ashby, Lever, or Workday).
+Every job must be {freshness_prompt}.
+Search specifically on:
+- boards.greenhouse.io OR job-boards.greenhouse.io
+- jobs.ashbyhq.com
+- jobs.lever.co
+- myworkdayjobs.com
+
+For each match found, return a valid JSON array of objects with the exact schema:
+[
+  {{
+    "title": "Job Title",
+    "company": "Company Name",
+    "location": "Location or Remote",
+    "url": "https://direct-ats-link...",
+    "posted_time": "e.g. 1 day ago / recent"
+  }}
+]
+Do not wrap in explanatory text. Only return the JSON array."""
+    try:
+        # pyrefly: ignore [missing-import]
+        from config.constants import DEFAULT_GROUNDED_SEARCH_MODELS
+        # pyrefly: ignore [missing-import]
+        from services.gemini_client import get_gemini_api_keys
+        
+        available_keys = [api_key] if api_key else (get_gemini_api_keys() or [os.getenv("GEMINI_API_KEY", "")])
+        available_keys = [k for k in available_keys if k]
+        if not available_keys:
+            return []
+
+        raw_text = ""
+        ATS_SEARCH_MODELS = DEFAULT_GROUNDED_SEARCH_MODELS
+        import concurrent.futures
+        all_429 = True
+        for search_model in ATS_SEARCH_MODELS:
+            for key_candidate in available_keys:
+                client = genai.Client(api_key=key_candidate)
+                try:
+                    def _do_ats_search():
+                        return client.models.generate_content(
+                            model=search_model,
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                tools=[types.Tool(google_search=types.GoogleSearch())],
+                                temperature=0.1
+                            )
+                        )
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        fut = executor.submit(_do_ats_search)
+                        try:
+                            response = fut.result(timeout=12.0)
+                        except concurrent.futures.TimeoutError:
+                            print(f"[Direct ATS Search] Model {search_model} timed out after 12s, trying fallback...")
+                            continue
+                    if response and response.text:
+                        raw_text = response.text.strip()
+                        if raw_text:
+                            break
+                except Exception as model_err:
+                    err_str = str(model_err).lower()
+                    if "429" in err_str or "resource_exhausted" in err_str:
+                        key_hint = f"...{key_candidate[-6:]}" if len(key_candidate) >= 6 else "key"
+                        print(f"[Direct ATS Search] Key {key_hint} quota limit reached (429), rotating to next API key...")
+                        continue
+                    all_429 = False
+                    print(f"[Direct ATS Search] Model {search_model} warning: {model_err}")
+                    break
+            if raw_text:
+                break
+        if not raw_text:
+            if all_429:
+                _ats_grounding_quota_exhausted = True
+                print("[Direct ATS Search] All candidate keys quota limited (429), flipping circuit breaker ON for session.")
+            return []
+            
+        items = []
+        # 1. Try JSON list extraction
+        json_match = re.search(r"\[\s*\{.*\}\s*\]", raw_text, re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(0))
+                if isinstance(parsed, list):
+                    items = parsed
+            except Exception:
+                pass
+
+        # 2. Fallback: Parse markdown block if JSON was not parsed
+        if not items:
+            current_item = {}
+            for line in raw_text.splitlines():
+                line = line.strip()
+                clean_line = re.sub(r"[\*#_]", "", line).strip()
+                m_title = re.search(r"^Title:\s*(.+)", clean_line, re.IGNORECASE)
+                m_comp = re.search(r"^Company:\s*(.+)", clean_line, re.IGNORECASE)
+                m_loc = re.search(r"^Location:\s*(.+)", clean_line, re.IGNORECASE)
+                m_time = re.search(r"^Posted:\s*(.+)", clean_line, re.IGNORECASE)
+
+                if m_title:
+                    if current_item.get("title") and current_item.get("url"):
+                        items.append(current_item)
+                        current_item = {}
+                    current_item["title"] = m_title.group(1).strip()
+                elif m_comp:
+                    current_item["company"] = m_comp.group(1).strip()
+                elif m_loc:
+                    current_item["location"] = m_loc.group(1).strip()
+                elif "url:" in clean_line.lower():
+                    u_match = re.search(r"https?://[^\s\]\)]+", line)
+                    if u_match:
+                        current_item["url"] = u_match.group(0).strip()
+                elif m_time:
+                    current_item["posted_time"] = m_time.group(1).strip()
+
+            if current_item.get("title") and current_item.get("url"):
+                items.append(current_item)
+
+        if not items:
+            return []
+
+        results: List[JobSearchResult] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url", "").strip()
+            if not url or not url.startswith("http"):
+                continue
+
+            # Detect platform
+            platform = "Direct ATS"
+            u_low = url.lower()
+            if "ashbyhq.com" in u_low:
+                platform = "Ashby"
+            elif "greenhouse.io" in u_low:
+                platform = "Greenhouse"
+            elif "lever.co" in u_low:
+                platform = "Lever"
+            elif "workday" in u_low:
+                platform = "Workday"
+
+            title_val = item.get("title", "").strip() or role
+            company_val = item.get("company", "").strip() or "Tech Company"
+            loc_val = item.get("location", "").strip() or location
+            posted_val = item.get("posted_time", "").strip() or timeframe
+
+            # Generate unique deterministic job_id
+            job_id = hashlib.md5(url.encode()).hexdigest()[:10]
+
+            results.append(
+                JobSearchResult(
+                    url=url,
+                    title=title_val,
+                    company=company_val,
+                    location=loc_val,
+                    post_date_raw=posted_val,
+                    platform=platform,
+                    job_id=job_id,
+                    full_description=item.get("description") or f"Direct ATS listing for {title_val} at {company_val}."
+                )
+            )
+
+        print(f"[Direct ATS Search] Found {len(results)} jobs for role '{role}' in '{location}' ({timeframe})")
+        log_ist(f"[Direct ATS Search] Found {len(results)} direct ATS jobs via Google Search Grounding for '{role}' in '{location}'")
+        return results
+    except Exception as e:
+        print(f"[Direct ATS Search] Error querying Gemini Google Search Grounding: {e}")
+        log_ist(f"[Direct ATS Search] Grounding search note: {e}")
+        return []
+
+
+# ─── LinkedIn Scraper (Unauthenticated API) ───────────────────────────────
+
+def search_linkedin_jobs(keyword: str, location: str = "Remote", timeframe: str = "48h", max_results: int = 75) -> List[JobSearchResult]:
+    """
+    Scrapes LinkedIn's guest job search API with pagination (start=0, 25, 50, ...)
+    to retrieve up to `max_results` fresh postings from the specified timeframe.
+    """
+    encoded_keyword = urllib.parse.quote(keyword)
+    encoded_location = urllib.parse.quote(location)
+    tf_norm = normalize_timeframe(timeframe)
+    
+    # Map timeframe to LinkedIn f_TPR parameter (seconds)
+    tpr_map = {
+        "24h": "r86400",
+        "48h": "r172800",
+        "1w": "r604800",
+        "1m": "r2592000"
+    }
+    tpr = tpr_map.get(tf_norm, "r172800")
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    
+    results = []
+    seen_job_ids = set()
+    offsets = [0, 25, 50, 75] if max_results > 50 else ([0, 25] if max_results > 25 else [0])
+    
+    for start_offset in offsets:
+        if len(results) >= max_results:
+            break
+            
+        url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords={encoded_keyword}&location={encoded_location}&f_TPR={tpr}&start={start_offset}"
+        log_ist(f"[Job Searcher] Fetching LinkedIn offset {start_offset}: {url}")
+        
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=12) as response:
+                html = response.read().decode("utf-8")
+                
+            soup = BeautifulSoup(html, "html.parser")
+            cards = soup.select("li")
+            if not cards:
+                # No more postings returned for this offset
+                break
+                
+            page_added = 0
+            for card in cards:
+                title_elem = card.select_one(".base-search-card__title")
+                company_elem = card.select_one(".base-search-card__subtitle")
+                location_elem = card.select_one(".job-search-card__location")
+                link_elem = card.select_one(".base-card__full-link")
+                date_elem = card.select_one(".job-search-card__listdate, .job-search-card__listdate--new")
+                
+                if not title_elem or not link_elem:
+                    continue
+                    
+                title = title_elem.get_text(strip=True)
+                company = company_elem.get_text(strip=True) if company_elem else "Unknown Company"
+                loc = location_elem.get_text(strip=True) if location_elem else location
+                href = str(link_elem.get("href", "")).split("?")[0] # Clean query trackers
+                date_str = date_elem.get_text(strip=True) if date_elem else "Just posted"
+                
+                # Extract job ID from href URN
+                job_id_match = re.search(r"-(\d+)$", href)
+                job_id = job_id_match.group(1) if job_id_match else href.split("/")[-1]
+                
+                if job_id in seen_job_ids:
+                    continue
+                seen_job_ids.add(job_id)
+                
+                results.append(JobSearchResult(
+                    title=title,
+                    company=company,
+                    location=loc,
+                    url=href,
+                    platform="LinkedIn",
+                    post_date_raw=date_str,
+                    job_id=job_id
+                ))
+                page_added += 1
+                if len(results) >= max_results:
+                    break
+                    
+            if page_added == 0:
+                break
+                
+            # Gentle delay between offsets to respect rate limits
+            import time
+            time.sleep(0.4)
+            
+        except Exception as e:
+            log_ist(f"[Job Searcher] LinkedIn search error at offset {start_offset}: {e}")
+            break
+            
+    return results
+
+# ─── Reed.co.uk Official API Integration ──────────────────────────────────────
+
+REED_API_KEY = os.getenv("REED_API_KEY")
+
+def search_reed_jobs(keyword: str, location: str = "London", timeframe: str = "24h") -> List[JobSearchResult]:
+    """
+    Search Reed.co.uk API for UK job listings.
+    Gates execution: skips network calls if location is outside UK (GB).
+    """
+    country_code = resolve_location_country(location)
+    if country_code != "GB":
+        log_ist(f"[Job Searcher] Skipping Reed.co.uk search for non-UK location: '{location}' (Country={country_code})")
+        return []
+
+    if not REED_API_KEY:
+        print("[Job Searcher] REED_API_KEY not configured. Skipping Reed search.")
+        return []
+
+    encoded_keyword = urllib.parse.quote(keyword)
+    encoded_location = urllib.parse.quote(location)
+    tf_norm = normalize_timeframe(timeframe)
+    
+    # Calculate cutoff date based on requested timeframe
+    from datetime import datetime, timedelta
+    days = 2
+    if tf_norm == "24h":
+        days = 1
+    elif tf_norm == "48h":
+        days = 2
+    elif tf_norm == "1w":
+        days = 7
+    elif tf_norm == "1m":
+        days = 30
+        
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    url = f"https://www.reed.co.uk/api/1.0/search?keywords={encoded_keyword}&locationName={encoded_location}&resultsToTake=100"
+    
+    log_ist(f"[Job Searcher] Fetching Reed API ({timeframe}): {url}")
+    raw_candidates = []
+    
+    import base64
+    auth_str = f"{REED_API_KEY}:"
+    b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+    
+    headers = {
+        "Authorization": f"Basic {b64_auth}",
+        "User-Agent": "JobFinderApp/1.0"
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for job in data.get("results", []):
+                title = job.get("jobTitle", "Job Posting")
+                company = job.get("employerName", "Reed Employer")
+                
+                # Filter out paid course / trainee fee / boot camp spam listings disguised as jobs
+                title_lower = title.lower()
+                company_lower = company.lower()
+                
+                spam_keywords = [
+                    "course cost", "job guarantee", "guaranteed job", "trainee fee", "course fee", 
+                    "refund you 100%", "training package", "newto", "nology", "learning people", 
+                    "the training room", "itol recruit", "traineeship", "training course", "fees apply"
+                ]
+                
+                if any(kw in company_lower or kw in title_lower for kw in spam_keywords):
+                    continue
+
+                loc = job.get("locationName", location)
+                job_url = job.get("jobUrl", "")
+                job_id = str(job.get("jobId", job_url))
+                post_date_str = job.get("date", "")
+                job_dt = None
+                if post_date_str:
+                    try:
+                        job_dt = datetime.strptime(post_date_str, "%d/%m/%Y")
+                        if job_dt < cutoff_date:
+                            continue
+                    except Exception:
+                        pass
+
+                raw_candidates.append({
+                    "job": JobSearchResult(
+                        title=title,
+                        company=company,
+                        location=loc,
+                        url=job_url,
+                        platform="Reed",
+                        post_date_raw=post_date_str or "Recent",
+                        job_id=job_id
+                    ),
+                    "job_id": job_id,
+                    "title": title,
+                    "dt": job_dt or datetime.min
+                })
+
+            # Concurrent pre-screening via ThreadPoolExecutor instead of sequential HTTP requests
+            def _check_reed_spam(candidate):
+                j_id = candidate["job_id"]
+                if j_id and j_id.isdigit():
+                    try:
+                        detail_req = urllib.request.Request(f"https://www.reed.co.uk/api/1.0/jobs/{j_id}", headers=headers)
+                        with urllib.request.urlopen(detail_req, context=SSL_CONTEXT, timeout=3) as detail_resp:
+                            detail_data = json.loads(detail_resp.read().decode("utf-8"))
+                            jd_raw = (detail_data.get("jobDescription", "") or "").lower()
+                            jd_spam_patterns = [
+                                "course cost", "course fee", "fees apply", "traineeship", "training course",
+                                "refund you 100%", "fees of £", "fee of £", "training cost", "payable by monthly",
+                                "per month for the course", "get your money back", "job guaranteed", "guaranteed job"
+                            ]
+                            if any(sp in jd_raw for sp in jd_spam_patterns):
+                                log_ist(f"[Job Searcher] Pre-screening rejected Reed course/fee listing ID {j_id}: '{candidate['title']}'")
+                                return None
+                    except Exception:
+                        pass
+                return candidate
+
+            # Run pre-screening checks concurrently across threads
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                screened_results = list(executor.map(_check_reed_spam, raw_candidates[:60]))
+            valid_results = [r for r in screened_results if r is not None]
+
+            # Sort by post date descending (newest jobs first)
+            valid_results.sort(key=lambda x: x["dt"], reverse=True)
+            final_jobs = [r["job"] for r in valid_results[:40]]
+            log_ist(f"[Job Searcher] Reed API returned {len(final_jobs)} fresh jobs within {timeframe} for '{keyword}' (sorted newest first)")
+            return final_jobs
+    except Exception as e:
+        log_ist(f"[Job Searcher] Reed API search error: {e}")
+
+    return []
+
+
+# ─── TargetJobs UK Graduate Scraper ───────────────────────────────────────
+
+async def search_targetjobs_uk(keyword: str, location: str = "Remote", timeframe: str = "48h") -> List[JobSearchResult]:
+    """
+    Scrapes TargetJobs.co.uk graduate & IT technology jobs for UK locations.
+    Uses direct JSON search service API with full descriptions for instant ATS scoring.
+    Gates execution: skips network calls if location is outside UK (GB).
+    """
+    country_code = resolve_location_country(location)
+    if country_code != "GB":
+        log_ist(f"[Job Searcher] Skipping TargetJobs.co.uk search for non-UK location: '{location}' (Country={country_code})")
+        return []
+
+    log_ist(f"[Job Searcher] Fetching TargetJobs UK graduate IT listings for '{keyword}' (Location={location})...")
+    api_url = "https://targetjobs.co.uk/ext/svc/inferno-search-service-1-0/search"
+
+    payload = {
+        "fields": [
+            "nid", "uuid", "title", "parent_organisation_title", "location", "regions",
+            "url", "path", "body", "salary_range", "salary_lower", "salary_upper",
+            "currency", "opportunity_type", "application_url", "application_deadline_date"
+        ],
+        "keys": [keyword.strip()] if keyword and keyword.strip() else [""],
+        "conditionGroup": {
+            "conjunction": "AND",
+            "groups": [
+                {
+                    "conjunction": "OR",
+                    "conditions": [{"name": "sectors", "value": "Technology", "operator": "="}],
+                    "tags": ["facet:sectors"]
+                },
+                {
+                    "conjunction": "OR",
+                    "conditions": [{"name": "opportunity_type", "value": "Graduate job", "operator": "="}],
+                    "tags": ["facet:opportunity_type"]
+                }
+            ]
+        },
+        "sort": [{"field": "last_published", "value": "desc"}],
+        "limit": 10,
+        "offset": 0,
+        "includePromoted": False
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": "https://targetjobs.co.uk/graduate-jobs/it",
+        "Origin": "https://targetjobs.co.uk"
+    }
+
+    results: List[JobSearchResult] = []
+
+    def _do_targetjobs_request():
+        req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+        with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        data = await asyncio.to_thread(_do_targetjobs_request)
+        docs = data.get("search", {}).get("documents", [])
+        promoted = data.get("promoted", {}).get("documents", []) if isinstance(data.get("promoted"), dict) else []
+        all_items = docs + promoted
+
+        seen_nids = set()
+        now_date = datetime.now(timezone.utc).date()
+        for doc in all_items:
+            nid = str(doc.get("nid", "") or doc.get("uuid", ""))
+            if not nid or nid in seen_nids:
+                continue
+            seen_nids.add(nid)
+
+            # Skip explicitly closed status
+            if doc.get("expired") is True or doc.get("status") == 0 or doc.get("status") is False or doc.get("is_closed") is True:
+                continue
+
+            title = doc.get("title", "").strip() or "Graduate IT Role"
+            org_info = doc.get("organisation", {}) if isinstance(doc.get("organisation"), dict) else {}
+            company = doc.get("parent_organisation_title") or org_info.get("title") or "TargetJobs Verified Employer"
+            doc_loc = doc.get("location") or doc.get("regions") or "UK (Hybrid/Remote)"
+            path = doc.get("path") or doc.get("url") or f"/jobs/{nid}"
+            full_url = f"https://targetjobs.co.uk{path}" if path.startswith("/") else path
+            raw_body = doc.get("body") or ""
+
+            # Check all possible application deadline/closing dates
+            deadline_val = doc.get("application_deadline_date") or doc.get("closing_date") or doc.get("unpublish_on") or doc.get("deadline")
+            if deadline_val:
+                try:
+                    clean_d = str(deadline_val).replace("Z", "+00:00")[:10]
+                    deadline_dt = datetime.strptime(clean_d, "%Y-%m-%d").date()
+                    if deadline_dt < now_date:
+                        log_ist(f"[Job Searcher] ⏳ Skipping expired TargetJobs listing '{title}' (Deadline was {clean_d})")
+                        continue
+                except Exception:
+                    pass
+
+            # Extract clean description from HTML body
+            clean_jd = ""
+            if raw_body:
+                soup = BeautifulSoup(raw_body, "html.parser")
+                clean_jd = soup.get_text(separator="\n", strip=True)
+
+            # Check if description or title indicates closed application
+            combined_text = (clean_jd + " " + title).lower()
+            if any(kw in combined_text for kw in [
+                "application closed", "applications closed", "applications are now closed", "applications have now closed",
+                "applications are closed", "no longer accepting applications", "no longer accepting submissions",
+                "no longer taking applications", "deadline passed", "deadline has passed", "closing date has passed",
+                "this role has expired", "this opportunity has closed", "this vacancy has closed", "this posting is closed",
+                "position closed", "vacancy closed", "role closed"
+            ]):
+                log_ist(f"[Job Searcher] Skipping closed TargetJobs listing '{title}'")
+                continue
+
+            results.append(JobSearchResult(
+                title=title,
+                company=company,
+                location=str(doc_loc),
+                url=full_url,
+                platform="TargetJobs",
+                post_date_raw="Recent",
+                job_id=f"targetjobs_{nid}",
+                full_description=clean_jd
+            ))
+
+            # Limit per query search stream to max 5 items
+            if len(results) >= 5:
+                break
+
+        log_ist(f"[Job Searcher] TargetJobs API returned {len(results)} active graduate tech jobs for '{keyword}'")
+    except Exception as te:
+        log_ist(f"[Job Searcher] TargetJobs search error for '{keyword}': {te}")
+
+    return results
+
+# ─── Jobserve.com Tech & IT Scraper ───────────────────────────────────────
+
+async def search_jobserve_jobs(keyword: str, location: str = "London", timeframe: str = "48h", browser: Optional[Any] = None) -> List[JobSearchResult]:
+    """
+    Search Jobserve (jobserve.com) for tech, AI, software engineering, and contract/permanent roles.
+    Uses Playwright browser automation to execute the ASP.NET AJAX search form and extract rendered job cards.
+    """
+    country_code = resolve_location_country(location)
+    if country_code not in ("GB", "US", "DE", "FR", "NL", "IE", "CA", "AU") and str(location).lower() not in ("remote", "london", "uk"):
+        return []
+
+    tf_norm = normalize_timeframe(timeframe)
+    age_val = "1" if tf_norm == "24h" else ("2" if tf_norm == "48h" else ("7" if tf_norm == "1w" else "30"))
+
+    # If location is 'Remote' or generic UK, use 'UK' or 'London' for Jobserve form
+    loc_clean = (location or "London").strip()
+    if loc_clean.lower() in ("remote", "uk", "united kingdom", "any", "all"):
+        loc_for_search = "UK"
+    else:
+        loc_for_search = loc_clean
+
+    log_ist(f"[Job Searcher] Fetching Jobserve listings ({timeframe}) for '{keyword}' in '{loc_for_search}'...")
+
+    results: List[JobSearchResult] = []
+    local_playwright = None
+    local_browser = None
+    target_browser = browser
+
+    if target_browser is None:
+        try:
+            from services.scraper import ensure_shared_browser_alive
+            target_browser = await ensure_shared_browser_alive()
+        except Exception:
+            target_browser = None
+
+    if target_browser is None:
+        try:
+            from playwright.async_api import async_playwright
+            local_playwright = await async_playwright().start()
+            local_browser = await local_playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+            target_browser = local_browser
+        except Exception as be:
+            log_ist(f"[Job Searcher] Playwright launch error for Jobserve: {be}")
+            return []
+
+    context = None
+    page = None
+    try:
+        context = await target_browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 900}
+        )
+        page = await context.new_page()
+
+        await page.goto("https://www.jobserve.com/gb/en/Job-Search/", wait_until="domcontentloaded", timeout=12000)
+
+        # Dismiss cookie banner if present
+        try:
+            cookie_btn = page.locator("a:has-text('Accept All'), button:has-text('Accept'), #onetrust-accept-btn-handler, #btnAccept").first
+            if await cookie_btn.count() > 0:
+                await cookie_btn.click()
+                await page.wait_for_timeout(150)
+        except Exception:
+            pass
+
+        # Fill search inputs
+        kw_input = page.locator("#txtKey, input[name*='txtKey']").first
+        if await kw_input.count() > 0:
+            await kw_input.fill(keyword.strip())
+
+        loc_input = page.locator("#txtLoc, input[name*='txtLoc']").first
+        if await loc_input.count() > 0:
+            await loc_input.fill(loc_for_search)
+
+        try:
+            age_select = page.locator("#selAge, select[name*='selAge']").first
+            if await age_select.count() > 0:
+                await age_select.select_option(value=age_val)
+        except Exception:
+            pass
+
+        search_btn = page.locator("#btnSearch, input[value='Search'], button:has-text('Search')").first
+        if await search_btn.count() > 0:
+            await search_btn.click()
+        else:
+            await page.keyboard.press("Enter")
+
+        try:
+            await page.wait_for_selector(".jobItem, tr[id^='job_'], div[id^='job_'], #JobResults", timeout=7000)
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        cards = await page.evaluate('''() => {
+            const items = [];
+            const divs = document.querySelectorAll(".jobItem, div[id^='job_'], tr[id^='job_']");
+            const activeJdEl = document.querySelector("#JobDetails, #td_jobdetails, #md_skills, .jobdetails, #RightSide");
+            const activeJdText = activeJdEl ? activeJdEl.innerText.trim() : "";
+
+            divs.forEach((div, idx) => {
+                const id = div.id || `js_card_${idx}`;
+                const titleEl = div.querySelector(".jobResultsTitle, h3, .jobtitle, .positiontitle, a");
+                const title = titleEl ? titleEl.innerText.trim() : "";
+                
+                const salaryEl = div.querySelector(".jobResultsSalary, .salary, .rate");
+                const salary = salaryEl ? salaryEl.innerText.trim() : "";
+
+                const locEl = div.querySelector(".jobResultsLoc, .location, .job_location");
+                const loc = locEl ? locEl.innerText.trim() : "UK";
+
+                const typeEl = div.querySelector(".jobResultsType, .jobtype, .perm_contract");
+                const jobType = typeEl ? typeEl.innerText.trim() : "Permanent/Contract";
+
+                const ageEl = div.querySelector(".when, .posted, .date");
+                const age = ageEl ? ageEl.innerText.trim() : "Recent";
+
+                const compEl = div.querySelector(".recruiter, .posted_by, .company, .agency_name");
+                const comp = compEl ? compEl.innerText.trim() : "Hiring Agency / Client";
+
+                const linkEl = div.querySelector("a[href*='/job/'], a[href*='/Job/'], a[id*='positionlink'], h3 a");
+                const href = linkEl ? linkEl.getAttribute('href') : "";
+                
+                // If this is the active/first selected card and activeJdText is rich, use it
+                let fullText = "";
+                if (idx === 0 && activeJdText && activeJdText.length > 200) {
+                    fullText = activeJdText;
+                } else {
+                    fullText = `Role: ${title}\nCompensation: ${salary}\nLocation: ${loc}\nType: ${jobType}\nPosted: ${age}\n\nKey details: High-priority technical opportunity posted directly via Jobserve.`;
+                }
+
+                if (title && title.length > 2) {
+                    items.push({ id, title, comp, loc, href, desc: fullText, salary, age, jobType });
+                }
+            });
+            return items;
+        }''')
+
+        seen_div_ids = set()
+        seen_canonical = set()
+        candidate_items = []
+
+        for c in cards:
+            div_id = c.get("id", "")
+            if div_id and div_id in seen_div_ids:
+                continue
+            if div_id:
+                seen_div_ids.add(div_id)
+
+            t = c.get("title", "")
+            if not t or any(skip in t.lower() for skip in ["cookie", "privacy", "help", "login", "register"]):
+                continue
+
+            # Clean salary/day-rate suffix from title (e.g. 'Senior QA Engineer, £300 per day inside IR35' -> 'Senior QA Engineer')
+            clean_title = re.sub(r',?\s*£\d+.*$', '', t).strip()
+            if not clean_title:
+                clean_title = t.strip()
+
+            # Tier 1 Canonical Key: Normalized alphanumeric title
+            c_key = re.sub(r'[^a-zA-Z0-9]', '', clean_title.lower())
+            if c_key in seen_canonical:
+                continue
+            seen_canonical.add(c_key)
+
+            c["clean_title"] = clean_title
+            candidate_items.append(c)
+
+        # Concurrently enrich top Jobserve candidates with real company and complete JD
+        import httpx
+        async def _enrich_jobserve_item(c_item: dict) -> JobSearchResult:
+            jid = c_item.get("id", "")
+            clean_t = c_item.get("clean_title") or c_item.get("title", "")
+            comp = c_item.get("comp", "Hiring Agency / Client")
+            loc = c_item.get("loc", loc_for_search)
+            salary = c_item.get("salary", "")
+            desc = c_item.get("desc", "")
+
+            direct_url = f"https://www.jobserve.com/gb/en/mob/job/{jid}" if jid and not jid.startswith("js_card_") else f"https://www.jobserve.com/gb/en/JobSearch.aspx?kw={urllib.parse.quote(clean_t)}&loc={urllib.parse.quote(loc_for_search)}"
+
+            if jid and not jid.startswith("js_card_"):
+                try:
+                    async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}, timeout=6.0) as client:
+                        resp = await client.get(f"https://www.jobserve.com/gb/en/mob/job/{jid}", follow_redirects=True)
+                        if resp.status_code == 200:
+                            s = BeautifulSoup(resp.text, "html.parser")
+                            art = s.find("article") or s
+                            raw = art.get_text(separator="\n", strip=True)
+
+                            # Extract Recruiter / Company
+                            rec_m = re.search(r'Posted\s+by\s*\n*\s*([^\n\r]+)', raw, re.IGNORECASE)
+                            if rec_m:
+                                comp = rec_m.group(1).strip()
+
+                            # Extract JD Body
+                            jd_body = raw
+                            if "Applicants must be eligible to work in the specified location" in jd_body:
+                                jd_body = jd_body.split("Applicants must be eligible to work in the specified location", 1)[-1].strip()
+                            elif "Apply Now" in jd_body:
+                                jd_body = jd_body.split("Apply Now", 1)[-1].strip()
+
+                            # Trim trailing footer/metadata
+                            for footer_tag in ["Permalink", "Job Reference", "Contact"]:
+                                if footer_tag in jd_body:
+                                    pos = jd_body.rfind(footer_tag)
+                                    if pos > len(jd_body) * 0.7:
+                                        jd_body = jd_body[:pos].strip()
+
+                            if len(jd_body) > 100:
+                                desc = jd_body
+                except Exception:
+                    pass
+
+            if not desc or len(desc) < 50:
+                desc = f"Role: {clean_t}\nCompensation: {salary}\nLocation: {loc}\nType: {c_item.get('jobType', 'Permanent/Contract')}\nPosted: {c_item.get('age', 'Recent')}\n\nTechnical specification available via Jobserve direct listing."
+
+            return JobSearchResult(
+                title=clean_t,
+                company=comp,
+                location=loc,
+                url=direct_url,
+                platform="Jobserve",
+                post_date_raw=f"Last {timeframe}",
+                job_id=jid or hashlib.md5(f"{clean_t}_{direct_url}".encode()).hexdigest()[:10],
+                full_description=desc
+            )
+
+        enriched_results = await asyncio.gather(*[_enrich_jobserve_item(item) for item in candidate_items[:25]])
+        results = [r for r in enriched_results if r is not None]
+
+        log_ist(f"[Job Searcher] Jobserve returned {len(results)} active tech listings for '{keyword}'")
+    except Exception as e:
+        log_ist(f"[Job Searcher] Jobserve Playwright search error for '{keyword}': {e}")
+    finally:
+        if page:
+            try: await page.close()
+            except Exception: pass
+        if context:
+            try: await context.close()
+            except Exception: pass
+        if local_browser:
+            try: await local_browser.close()
+            except Exception: pass
+        if local_playwright:
+            try: await local_playwright.stop()
+            except Exception: pass
+
+    return results
+
+
+# ─── Indeed Scraper (Playwright Stealth Browser) ───────────────────────────
+
+def _is_local_deployment() -> bool:
+    if any(os.getenv(v) for v in ("RENDER", "RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "FLY_APP_NAME")):
+        return False
+    frontend_url = os.getenv("FRONTEND_URL", "")
+    return "localhost" in frontend_url or "127.0.0.1" in frontend_url
+
+async def search_indeed_jobs(keyword: str, location: str = "Remote", timeframe: str = "48h") -> List[JobSearchResult]:
+    """Scrapes Indeed public job postings from specified timeframe using Playwright browser emulations."""
+    global _indeed_blocked_circuit_breaker
+    if _indeed_blocked_circuit_breaker:
+        log_ist("[Job Searcher] Indeed circuit breaker ACTIVE (Cloudflare block detected previously). Skipping Indeed scraping.")
+        return []
+
+    encoded_keyword = urllib.parse.quote(keyword)
+    encoded_location = urllib.parse.quote(location)
+    tf_norm = normalize_timeframe(timeframe)
+    
+    # Resolve regional Indeed domain based on target location (e.g. Hyderabad -> in.indeed.com)
+    indeed_domain, country_code = get_indeed_domain_for_location(location)
+
+    # Map timeframe to Indeed fromage parameter (days)
+    fromage_map = {
+        "24h": "1",
+        "48h": "2",
+        "1w": "7",
+        "1m": "30"
+    }
+    fromage = fromage_map.get(tf_norm, "2")
+    url = f"https://{indeed_domain}/jobs?q={encoded_keyword}&l={encoded_location}&fromage={fromage}"
+    
+    log_ist(f"[Job Searcher] Fetching Indeed ({indeed_domain}, Country={country_code}): {url}")
+    results = []
+
+    # Fast path: Parse Indeed RSS XML feed directly via urllib (bypasses Cloudflare & Playwright)
+    try:
+        rss_url = f"https://{indeed_domain}/rss?q={urllib.parse.quote(keyword)}&l={urllib.parse.quote(location)}"
+        req = urllib.request.Request(
+            rss_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1",
+                "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://www.google.com/"
+            }
+        )
+        with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=5) as resp:
+            rss_xml = resp.read().decode("utf-8", errors="ignore")
+            rss_soup = BeautifulSoup(rss_xml, "xml")
+            items = rss_soup.find_all("item")
+            if items:
+                for item in items[:15]:
+                    _title_tag = item.find("title")
+                    _link_tag = item.find("link")
+                    _date_tag = item.find("pubDate")
+                    source_elem = item.find("source")
+                    raw_title = _title_tag.get_text().strip() if _title_tag else "Indeed Job"
+                    link = _link_tag.get_text().strip() if _link_tag else url
+                    pub_date = _date_tag.get_text().strip() if _date_tag else "Recent"
+                    company_name = source_elem.get_text().strip() if source_elem else "Indeed Employer"
+                    
+                    jk_match = re.search(r'[?&]jk=([a-f0-9]{16})', link)
+                    j_id = jk_match.group(1) if jk_match else link.split("/")[-1] or "unknown"
+
+                    results.append(JobSearchResult(
+                        title=raw_title,
+                        company=company_name,
+                        location=location,
+                        url=link,
+                        platform="Indeed",
+                        post_date_raw=pub_date,
+                        job_id=j_id
+                    ))
+                log_ist(f"[Job Searcher] Instantly fetched {len(results)} Indeed jobs via RSS XML feed for '{keyword}'")
+                return results
+    except Exception as rss_err:
+        log_ist(f"[Job Searcher] Indeed RSS fetch skipped ({rss_err}), attempting Playwright fallback...")
+
+    # pyrefly: ignore [missing-import]
+    from playwright.async_api import async_playwright
+
+    html = ""
+    page_title = ""
+    status = None
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-infobars",
+                    "--window-position=0,0",
+                    "--ignore-certificate-errors",
+                    "--ignore-certificate-errors-spki-list"
+                ]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                device_scale_factor=1,
+                has_touch=False,
+                is_mobile=False,
+                locale="en-US",
+                timezone_id="Asia/Kolkata"
+            )
+            page = await context.new_page()
+
+            # Inject enhanced anti-bot evasion scripts
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+                );
+            """)
+
+            response = None
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=8000)
+            except Exception as e:
+                print(f"[Job Searcher] Indeed navigation timed out, checking loaded content: {e}")
+
+            await page.wait_for_timeout(500)
+            html = await page.content()
+            page_title = await page.title()
+            status = response.status if response else None
+            await browser.close()
+    except Exception as pw_err:
+        print(f"[Job Searcher] Playwright browser launch skipped ({pw_err}). Proceeding to search fallback.")
+        page_title = "Just a moment..."
+        status = 403
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select(".job_seen_beacon")
+
+        if not cards and (status == 403 or "blocked" in page_title.lower() or "just a moment" in page_title.lower()):
+            _indeed_blocked_circuit_breaker = True
+            log_ist(f"[Job Searcher] Indeed Cloudflare Challenge triggered (status={status}, title={page_title!r}). Flipping circuit breaker ON to skip remaining Indeed calls. LinkedIn & Reed search remain 100% operational.")
+            return results
+
+        for card in cards:
+            title_elem = card.select_one(".jobTitle a span[title]") or card.select_one(".jobTitle a")
+            company_elem = card.select_one("[data-testid='company-name']")
+            location_elem = card.select_one("[data-testid='text-location']")
+            link_elem = card.select_one("a.jcs-JobTitle") or card.select_one(".jobTitle a")
+            date_elem = card.select_one(".date")
+            
+            if not title_elem or not link_elem:
+                continue
+                
+            title = title_elem.get_text(strip=True)
+            company = company_elem.get_text(strip=True) if company_elem else "Unknown Company"
+            loc = location_elem.get_text(strip=True) if location_elem else location
+            jk = link_elem.get("data-jk", "")
+            href = f"https://{indeed_domain}/viewjob?jk={jk}" if jk else f"https://{indeed_domain}"
+            date_str = date_elem.get_text(strip=True) if date_elem else "2 days ago"
+            
+            results.append(JobSearchResult(
+                title=title,
+                company=company,
+                location=loc,
+                url=href,
+                platform="Indeed",
+                post_date_raw=date_str,
+                job_id=str(jk) if jk else href
+            ))
+            
+    except Exception as e:
+        print(f"[Job Searcher] Indeed search error: {e}")
+        
+    return results
+
+# ─── Combined Aggregation & Scoring Pipeline ──────────────────────────────
+
+# Dynamically scale concurrency based on the hosting environment:
+# - We check for an explicit override environment variable SCRAPER_CONCURRENCY
+# - Render automatically injects "RENDER" into all web service environments under the hood.
+# - If none is found, we use a conservative default of 3 (prevents memory spikes and rate-limiting on cloud containers)
+try:
+    env_concurrency = os.getenv("SCRAPER_CONCURRENCY")
+    if env_concurrency is not None:
+        DISCOVERY_FETCH_CONCURRENCY = int(env_concurrency)
+    else:
+        DISCOVERY_FETCH_CONCURRENCY = 3
+except Exception:
+    DISCOVERY_FETCH_CONCURRENCY = 3
+
+
+def _title_heuristic_score(job: JobSearchResult, resume_data: dict) -> int:
+    """
+    Cheap title-only pre-rank used ONLY to decide which jobs are worth the cost
+    of fetching their real JD (see DISCOVERY_JD_FETCH_CAP below) — NOT the final
+    displayed score, which always comes from compute_ats_score() against the
+    actual job description via _score_job_with_real_jd, same as Tailor Resume.
+
+    Derived generically from the candidate's own resume (skill-alias matches in
+    the title + seniority-tier alignment via the existing ats_scorer taxonomy)
+    rather than hardcoded domain keywords, so it ranks fairly regardless of
+    whether the candidate is in data/ML, frontend, backend, etc.
+    """
+    title_lower = job.title.lower()
+
+    resume_skill_set = _extract_taxonomy_skills(" ".join(resume_data.get("skills", [])))
+    title_skill_set = _extract_taxonomy_skills(title_lower)
+    matched_count = len(resume_skill_set & title_skill_set)
+
+    candidate_tier = get_candidate_seniority_tier(resume_data)
+    tier_hierarchy = {"junior": 1, "mid": 2, "senior": 3, "lead": 4, "executive": 5}
+    title_tier = "mid"
+    for tier, pattern in _COMPILED_TITLE_TIER_PATTERNS:
+        if pattern.search(title_lower):
+            title_tier = tier
+            break
+    tier_gap = abs(tier_hierarchy.get(candidate_tier, 2) - tier_hierarchy.get(title_tier, 2))
+
+    return 70 + (matched_count * 8) - (tier_gap * 10)
+
+
+def _scrape_linkedin_company_headcount(company_name: str) -> Optional[str]:
+    """
+    Directly scrapes official company headcount scale from LinkedIn company pages
+    (e.g. /company/<slug>/posts/ or /company/<slug>/) using:
+    1. 'Company size' <dd> text (e.g. '1,001-5,000 employees', '51-200 employees')
+    2. Employee link / aria-label (e.g. 'Search more employees' -> '1K-5K employees')
+    3. 'View all X employees' counter normalized to standard brackets
+    """
+    if not company_name or len(company_name.strip()) < 2:
+        return None
+    import re
+    import urllib.request
+
+    clean = re.sub(r'[^a-zA-Z0-9\s\-]', '', company_name).strip()
+    slug_candidates = [
+        clean.lower().replace(' ', '-'),
+        clean.lower().replace(' ', ''),
+    ]
+    # Remove generic legal/jurisdiction suffixes for clean slug matching
+    no_suffix = re.sub(r'\b(ltd|limited|plc|inc|group|corporation|bank|uk)\b', '', clean, flags=re.I).strip()
+    if no_suffix and no_suffix.lower() != clean.lower():
+        slug_candidates.append(no_suffix.lower().replace(' ', '-'))
+        slug_candidates.append(no_suffix.lower().replace(' ', ''))
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+
+    seen_slugs = set()
+    for slug in slug_candidates:
+        if not slug or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        for path in [f'/company/{slug}/posts/', f'/company/{slug}/']:
+            url = f'https://www.linkedin.com{path}'
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=3.5) as resp:
+                    if resp.status == 200:
+                        html = resp.read().decode('utf-8', errors='ignore')
+
+                        # 1. Look for <dd class="..."> 1,001-5,000 employees </dd> after Company size
+                        m1 = re.search(r'Company size\s*</dt>\s*<dd[^>]*>(.*?)</dd>', html, re.S | re.I)
+                        if m1:
+                            raw_val = re.sub(r'<[^>]+>', ' ', m1.group(1))
+                            raw_val = re.sub(r'\s+', ' ', raw_val).strip()
+                            if 'employees' in raw_val.lower() or any(c.isdigit() for c in raw_val):
+                                return raw_val
+
+                        # 2. Look for employee link / aria-label: e.g. <a aria-label="Search more employees">1K-5K employees</a>
+                        m_aria = re.search(r'<a[^>]*aria-label=[\'"][^\'"]*employees[^\'"]*[\'"][^>]*>(.*?)</a>', html, re.S | re.I)
+                        if m_aria:
+                            raw_val = re.sub(r'<[^>]+>', '', m_aria.group(1)).strip()
+                            if raw_val and ('employees' in raw_val.lower() or any(c.isdigit() for c in raw_val)):
+                                return raw_val
+
+                        # 3. View all X employees
+                        m_view = re.search(r'View all\s+([\d,]+)\s+employees', html, re.I)
+                        if m_view:
+                            count = int(m_view.group(1).replace(',', ''))
+                            if count <= 10: return '1-10 employees'
+                            if count <= 50: return '11-50 employees'
+                            if count <= 200: return '51-200 employees'
+                            if count <= 500: return '201-500 employees'
+                            if count <= 1000: return '501-1,000 employees'
+                            if count <= 5000: return '1,001-5,000 employees'
+                            if count <= 10000: return '5,001-10,000 employees'
+                            return '10,000+ employees'
+            except Exception:
+                pass
+    return None
+
+
+def _resolve_company_headcount_db(company_name: str) -> Optional[str]:
+    """Retrieves cached company headcount or scrapes live from LinkedIn and caches in SQLite."""
+    if not company_name or len(company_name.strip()) < 2:
+        return None
+    import sqlite3
+    import time
+    norm = company_name.strip().lower()
+    db_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "company_meta.db")
+    try:
+        os.makedirs(os.path.dirname(db_file), exist_ok=True)
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS company_scale (norm_company TEXT PRIMARY KEY, company_size TEXT, updated_at REAL);")
+        c.execute("SELECT company_size FROM company_scale WHERE norm_company = ?", (norm,))
+        row = c.fetchone()
+        if row and row[0]:
+            conn.close()
+            return row[0]
+        
+        # Scrape directly from LinkedIn company page (no LLM hallucination)
+        scraped_size = _scrape_linkedin_company_headcount(company_name)
+        if scraped_size:
+            c.execute("INSERT OR REPLACE INTO company_scale VALUES (?, ?, ?)", (norm, scraped_size, time.time()))
+            conn.commit()
+            conn.close()
+            return scraped_size
+
+        conn.close()
+    except Exception:
+        pass
+    return None
+
+
+def _extract_company_size(text: str, company_name: Optional[str] = None) -> Optional[str]:
+    """
+    Extracts standardized headcount or team scale dynamically from job text,
+    page criteria, or automated live company headcount resolution.
+    """
+    # 1. Direct standard bracket (e.g. '1,001-5,000 employees', '51-200 employees')
+    if text:
+        m1 = re.search(r'(\b\d{1,3}(?:,\d{3})*\s*(?:-|–|to)\s*\d{1,3}(?:,\d{3})*\+?\s+(?:employees|people|staff|team members)\b)', text, re.IGNORECASE)
+        if m1:
+            return m1.group(1).strip()
+
+        # 2. Open-ended scale (e.g. '10,000+ employees', '500+ staff')
+        m2 = re.search(r'(\b(?:10,000\+|5,000\+|1,000\+|500\+|200\+|100\+|50\+)\s+(?:employees|people|staff|team members)\b)', text, re.IGNORECASE)
+        if m2:
+            return m2.group(1).strip()
+
+        # 3. Labelled company size (e.g. 'Company size: 50-100')
+        m3 = re.search(r'(?:company size|team size|company headcount|organization size)[\s:]*([0-9,]+(?:\s*-\s*[0-9,]+)?(?:\+)?(?:\s*employees)?)', text, re.IGNORECASE)
+        if m3:
+            cand = m3.group(1).strip()
+            if not cand.lower().endswith("employees"):
+                cand = f"{cand} employees"
+            return cand
+
+        # 4. Contextual headcount sentences (e.g. "We are a team of 45 engineers", "growing company of 250 people")
+        m4 = re.search(r'\b(?:team|company|organization)\s+of\s+([0-9,]+)\+?\s+(?:people|employees|engineers|staff)\b', text, re.IGNORECASE)
+        if m4:
+            try:
+                num = int(m4.group(1).replace(",", ""))
+                if num <= 10: return "1-10 employees"
+                if num <= 50: return "11-50 employees"
+                if num <= 200: return "51-200 employees"
+                if num <= 500: return "201-500 employees"
+                if num <= 1000: return "501-1,000 employees"
+                if num <= 5000: return "1,001-5,000 employees"
+                return "5,000+ employees"
+            except Exception:
+                pass
+
+    # 5. Live resolution for hiring company name
+    if company_name and len(company_name.strip()) >= 2 and company_name.lower() not in ["hiring company", "target role", "confidential"]:
+        db_size = _resolve_company_headcount_db(company_name)
+        if db_size:
+            return db_size
+
+    return None
+
+
+def _extract_salary_and_seniority(text: str, title: str, company: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """Extracts salary estimate, seniority classification, and company size from title and description text."""
+    seniority = None
+    title_lower = (title or "").lower()
+    for tier, pattern in _COMPILED_TITLE_TIER_PATTERNS:
+        if pattern.search(title_lower):
+            seniority = tier.capitalize()
+            break
+    
+    if not seniority:
+        text_lower = (text or "")[:1500].lower()
+        for tier, pattern in _COMPILED_TITLE_TIER_PATTERNS:
+            if pattern.search(text_lower):
+                seniority = tier.capitalize()
+                break
+
+    salary = None
+    if text:
+        # Match common salary patterns like $120,000 - $160,000, £80k - £100k, €75,000 /yr, etc.
+        salary_match = re.search(
+            r'([$£€]\s*[\d,]+(?:\.\d+)?\s*(?:k|K)?(?:\s*(?:-|to|–)\s*[$£€]?\s*[\d,]+(?:\.\d+)?\s*(?:k|K)?)?(?:\s*(?:per\s+annum|per\s+year|p\.a\.|/yr|/year|/hr|per\s+hour))?)',
+            text
+        )
+        if salary_match:
+            cand = salary_match.group(1).strip()
+            # Basic sanity check on length and numeric content
+            if len(cand) >= 3 and any(char.isdigit() for char in cand):
+                salary = cand
+
+    company_size = _extract_company_size(text, company)
+
+    return {"seniority": seniority, "salary": salary, "company_size": company_size}
+
+
+async def _score_job_with_real_jd(job: JobSearchResult, resume_data: dict, browser, semaphore: asyncio.Semaphore, on_log=None) -> Optional[dict]:
+    """Fetches the real JD for a single job (with 24h TTLCache lookup) and scores it with the exact same
+    deterministic engine (compute_ats_score / compute_overall_score) that the
+    Tailor Resume flow uses, so discovery's overall score is directly comparable
+    to the ATS score shown after tailoring — not a separately-invented estimate."""
+    url_cache_key = f"jd_scrape_{hashlib.md5(job.url.encode('utf-8')).hexdigest()}"
+    cached_scraped = _job_search_cache.get(url_cache_key)
+
+    if hasattr(job, "full_description") and job.full_description and len(job.full_description.strip()) > 20:
+        scraped = {"description": job.full_description, "title": job.title, "company": job.company}
+        _job_search_cache.set(url_cache_key, scraped)
+        try:
+            from services.jd_cache import cache_set
+            cache_set(job.url, scraped)
+        except Exception:
+            pass
+    elif cached_scraped:
+        scraped = cached_scraped
+    else:
+        async with semaphore:
+            try:
+                scraped = await scrape_job_description(job.url, browser=browser, on_log=on_log)
+                if scraped and scraped.get("description"):
+                    _job_search_cache.set(url_cache_key, scraped)
+                    try:
+                        # pyrefly: ignore [missing-import]
+                        from services.jd_cache import cache_set
+                        cache_set(job.url, scraped)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[Job Searcher] Failed to fetch JD for '{job.title}' at {job.url}: {e}")
+                return None
+
+    jd_text = scraped.get("description", "")
+    raw_text = scraped.get("raw_text", "")
+    if not jd_text or len(jd_text.strip()) < 20:
+        return None
+
+    # Filter out paid courses / fee-based training schemes disguised as jobs inside BOTH cleaned JD and raw scraped HTML text
+    combined_text_lower = (jd_text + "\n" + raw_text).lower()
+    fee_patterns = [
+        "course cost", "course fee", "fees apply", "traineeship", "training course and fees",
+        "refund you 100%", "fees of £", "fee of £", "training cost", "payable by monthly",
+        "per month for the course", "get your money back", "job guaranteed - complete",
+        "job guaranteed", "training course", "course fees"
+    ]
+    if any(fp in combined_text_lower for fp in fee_patterns):
+        print(f"[Job Searcher] Rejecting fee-based course/training listing: '{job.title}'")
+        return None
+
+    ats = compute_ats_score(resume_data, jd_text)
+    if not ats.eligible:
+        return None
+    role_fit = estimate_role_fit_score(resume_data, jd_text)
+    overall_score = compute_overall_score(ats.skills_score, ats.experience_score, role_fit)
+
+    recruiter_name = None
+    recruiter_profile_url = None
+    if job.platform == "LinkedIn":
+        try:
+            recruiter_info = await asyncio.wait_for(
+                extract_recruiter(job.url, platform="linkedin", html=scraped.get("html"), browser=browser, allow_grounding=False),
+                timeout=6.0
+            )
+            recruiter_name = recruiter_info.get("recruiter_name")
+            recruiter_profile_url = recruiter_info.get("recruiter_profile_url")
+        except asyncio.TimeoutError:
+            print(f"[Job Searcher] Recruiter HTML extraction timed out for '{job.title}', proceeding")
+        except Exception as e:
+            print(f"[Job Searcher] Failed to extract recruiter info for '{job.title}': {e}")
+
+    meta_info = _extract_salary_and_seniority(jd_text, job.title, job.company)
+
+    # Attach UK visa sponsorship status and advice notice
+    sponsor_info = None
+    try:
+        from services.uk_sponsor_service import check_uk_sponsor
+        sponsor_info = check_uk_sponsor(job.company)
+    except Exception:
+        pass
+
+    return {
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+        "url": job.url,
+        "platform": job.platform,
+        "age": job.post_date_raw,
+        "score": overall_score,
+        "skills_score": ats.skills_score,
+        "experience_score": ats.experience_score,
+        "role_fit_score": role_fit,
+        "candidate_years": ats.candidate_years,
+        "required_years": ats.required_years,
+        "matched_skills": ats.matched_skills,
+        "missing_skills": ats.missing_skills,
+        "estimated": False,
+        "recruiter_name": recruiter_name,
+        "recruiter_profile_url": recruiter_profile_url,
+        "description": jd_text,
+        "raw_text": raw_text,
+        "seniority": meta_info.get("seniority"),
+        "salary": meta_info.get("salary"),
+        "company_size": meta_info.get("company_size"),
+        "sponsor_info": sponsor_info,
+        "is_uk_sponsor": bool(sponsor_info.get("is_sponsor")) if sponsor_info else None,
+    }
+
+
+def _score_job_with_title_heuristic(job: JobSearchResult, resume_data: dict) -> dict:
+    """Fallback scoring for jobs past the JD-fetch cap — no JD text is available,
+    so this derives everything from taxonomy skill matches in the title (same
+    SKILL_ALIASES taxonomy compute_ats_score uses) rather than hardcoded domain
+    keywords, so it isn't biased toward any one field (e.g. data/ML). Tagged
+    estimated=True so the UI can visually distinguish it from a real ATS-scored
+    result rather than silently presenting it as equally accurate."""
+    title_lower = job.title.lower()
+
+    resume_skill_set = _extract_taxonomy_skills(" ".join(resume_data.get("skills", [])))
+    title_skill_set = _extract_taxonomy_skills(title_lower)
+    matched_skills = sorted(resume_skill_set & title_skill_set)
+    missing_skills = sorted(title_skill_set - resume_skill_set)
+
+    total_title_skills = len(title_skill_set) or 1
+    # If the title has no recognizable taxonomy skill keywords at all (e.g. a
+    # role-flavor title like "AI-Native Product Engineer" instead of a
+    # tech-stack title), there's nothing to actually measure — use the same
+    # neutral default as compute_skills_score's unscoreable-JD case, and don't
+    # imply a real 0/0 skill match ratio behind a misleadingly high percentage.
+    skills_score = max(40, min(95, int((len(matched_skills) / total_title_skills) * 100))) if title_skill_set else 60
+
+    cand_years, avg_tenure, weighted_segments, _ = calculate_flattened_experience(resume_data)
+
+    req_years = 2
+    title_years_match = re.search(r'(\d+)\s*(?:\+|to|-)?\s*\d*\s*(?:year|yr|y/o)', title_lower)
+    if title_years_match:
+        try:
+            req_years = int(title_years_match.group(1))
+        except ValueError:
+            pass
+    else:
+        candidate_tier = get_candidate_seniority_tier(resume_data)
+        title_tier = "mid"
+        for tier, pattern in _COMPILED_TITLE_TIER_PATTERNS:
+            if pattern.search(title_lower):
+                title_tier = tier
+                break
+        req_years = 5 if title_tier in ("senior", "lead", "executive") else 2
+
+    experience_score = 95
+    if cand_years < req_years:
+        experience_score = max(40, 95 - int((req_years - cand_years) * 10))
+    elif cand_years > req_years + 3:
+        experience_score = 85
+
+    role_fit_score = estimate_role_fit_score(resume_data, job.title)
+
+    overall_score = int(0.40 * skills_score + 0.35 * experience_score + 0.25 * role_fit_score)
+
+    meta_info = _extract_salary_and_seniority(getattr(job, "full_description", "") or "", job.title, job.company)
+
+    # Attach UK visa sponsorship status and advice notice
+    sponsor_info = None
+    try:
+        from services.uk_sponsor_service import check_uk_sponsor
+        sponsor_info = check_uk_sponsor(job.company)
+    except Exception:
+        pass
+
+    return {
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+        "url": job.url,
+        "platform": job.platform,
+        "age": job.post_date_raw,
+        "score": overall_score,
+        "skills_score": skills_score,
+        "experience_score": experience_score,
+        "role_fit_score": role_fit_score,
+        "candidate_years": cand_years,
+        "required_years": req_years,
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
+        "estimated": True,
+        "description": getattr(job, "full_description", None) or f"Role: {job.title} at {job.company} ({job.location}). Direct listing from {job.platform}. Open link to view complete requirements.",
+        "seniority": meta_info.get("seniority"),
+        "salary": meta_info.get("salary"),
+        "company_size": meta_info.get("company_size"),
+        "sponsor_info": sponsor_info,
+        "is_uk_sponsor": bool(sponsor_info.get("is_sponsor")) if sponsor_info else None,
+    }
+
+
+
+async def find_matching_jobs(
+    resume_data: dict,
+    location: str = "Remote",
+    keywords: Optional[str] = None,
+    timeframe: str = "48h",
+    custom_api_key: Optional[str] = None,
+    browser: Optional[Any] = None,
+    exclude_portals: Optional[List[str]] = None,
+    target_platforms: Optional[List[str]] = None
+):
+    """
+    Main aggregator pipeline:
+    1. Resolves search queries (either user-entered keywords or auto-generates from resume).
+    2. Fetches LinkedIn, Indeed, Reed, TargetJobs, Jobserve & ATS Portals concurrently.
+    3. Respects target_platforms filter (Ashby, Greenhouse, Lever, BambooHR, Workday, LinkedIn, Jobserve, Indeed, Reed).
+    4. Respects exclude_portals (defaults to ['targetjobs'] to skip graduate portal unless explicitly opted in).
+    5. Ranks by a cheap title heuristic, then fetches the real JD for top jobs and scores them.
+    6. Filters and returns job matches >= 55%.
+    """
+    if exclude_portals is None:
+        exclude_portals = ["targetjobs"]
+
+    target_plats = [p.strip().lower() for p in (target_platforms or []) if p.strip()]
+    platform_filter_active = len(target_plats) > 0 and "all" not in target_plats
+
+    # Normalize keywords: handle list or string cleanly
+    if isinstance(keywords, list):
+        keywords = ", ".join(str(k) for k in keywords if k)
+    elif keywords:
+        keywords = str(keywords)
+
+    if keywords and keywords.strip():
+        # User-provided search role overrides
+        queries = [q.strip() for q in keywords.split(",") if q.strip()]
+        msg = f"Using user-preferred search queries: {', '.join(queries)}"
+        log_ist(msg)
+        yield json.dumps({"type": "log", "message": msg}) + " " * 2048 + "\n"
+    else:
+        msg1 = "Analyzing resume context to generate optimal search queries..."
+        log_ist(msg1)
+        yield json.dumps({"type": "log", "message": msg1}) + " " * 2048 + "\n"
+        queries = await asyncio.to_thread(generate_search_queries_from_resume, resume_data, custom_api_key)
+        msg2 = f"Generated search queries: {', '.join(queries)}"
+        log_ist(msg2)
+        yield json.dumps({"type": "log", "message": msg2}) + " " * 2048 + "\n"
+
+    # Determine target country for clean user status logs
+    target_country = resolve_location_country(location)
+    platform_label = "LinkedIn, Indeed, Reed, Jobserve, Greenhouse, Ashby & Lever"
+
+    # Concurrently scan configured target portals (Greenhouse, Ashby, Lever, BambooHR, Workday)
+    portal_jobs_raw = []
+    excluded_clean = [p.strip().lower() for p in (exclude_portals or []) if p.strip()]
+    active_ats_scanned = [
+        p for p in ["Greenhouse", "Ashby", "Lever", "BambooHR", "Workday"]
+        if p.lower() not in excluded_clean and (not platform_filter_active or p.lower() in target_plats or "ats" in target_plats)
+    ]
+    should_scan_portals = len(active_ats_scanned) > 0
+
+    if should_scan_portals:
+        portal_start_msg = f"Scanning target ATS Portals ({', '.join(active_ats_scanned)})..."
+        log_ist(portal_start_msg)
+        yield json.dumps({"type": "log", "message": portal_start_msg}) + " " * 2048 + "\n"
+        try:
+            # pyrefly: ignore [missing-import]
+            from services.portal_scanner import PortalScanner
+            scanner = PortalScanner()
+            portal_results = await asyncio.wait_for(
+                scanner.scan_all_portals(
+                    target_keywords=queries,
+                    timeframe=timeframe,
+                    location=location,
+                    target_portals=target_plats if platform_filter_active else None,
+                    exclude_portals=excluded_clean
+                ),
+                timeout=60.0
+            )
+            gh_cnt = sum(1 for pj in portal_results if pj.get("portal") == "greenhouse")
+            ash_cnt = sum(1 for pj in portal_results if pj.get("portal") == "ashby")
+            lev_cnt = sum(1 for pj in portal_results if pj.get("portal") == "lever")
+            bam_cnt = sum(1 for pj in portal_results if pj.get("portal") == "bamboohr")
+            wd_cnt = sum(1 for pj in portal_results if pj.get("portal") == "workday")
+            
+            for pj in portal_results:
+                p_obj = JobSearchResult(
+                    title=pj.get("title", ""),
+                    company=pj.get("company", ""),
+                    location=pj.get("location", "Remote/Unspecified"),
+                    url=pj.get("url", ""),
+                    platform=pj.get("portal", "Portal").title(),
+                    post_date_raw=pj.get("age", "Active"),
+                    job_id=pj.get("id", hashlib.md5(pj.get("url", "").encode()).hexdigest()[:10]),
+                    full_description=pj.get("description", "")
+                )
+                if not platform_filter_active or any(tp in p_obj.platform.lower() for tp in target_plats):
+                    portal_jobs_raw.append(p_obj)
+            portal_done_msg = f"Found {gh_cnt} Greenhouse, {ash_cnt} Ashby, {lev_cnt} Lever, {bam_cnt} BambooHR & {wd_cnt} Workday direct portal postings ({len(portal_jobs_raw)} total)"
+            log_ist(portal_done_msg)
+            yield json.dumps({"type": "log", "message": portal_done_msg}) + " " * 2048 + "\n"
+        except asyncio.TimeoutError:
+            warn_msg = "[find_matching_jobs] Direct ATS portal scan timed out after 60s, proceeding with live listings."
+            log_ist(warn_msg)
+            print(warn_msg)
+        except Exception as pe:
+            err_msg = f"[find_matching_jobs] PortalScanner error: {pe}"
+            log_ist(err_msg)
+            print(err_msg)
+
+    # Parallelize multi-query search across all queries and platforms concurrently
+    raw_jobs = list(portal_jobs_raw)
+    indeed_jobs_for_est = []
+
+    yield_msg = f"Concurrently fetching listings across {len(queries)} query streams: {', '.join(queries)}..."
+    log_ist(yield_msg)
+    yield json.dumps({"type": "log", "message": yield_msg}) + " " * 2048 + "\n"
+
+    async def _fetch_query_cluster(q: str):
+        async def _safe_run(coro_or_func, *args, default=[], timeout=20):
+            try:
+                if inspect.iscoroutinefunction(coro_or_func):
+                    return await asyncio.wait_for(coro_or_func(*args), timeout=timeout)
+                else:
+                    return await asyncio.wait_for(asyncio.to_thread(coro_or_func, *args), timeout=timeout)
+            except asyncio.TimeoutError:
+                log_ist(f"[Job Searcher] Search timeout ({timeout}s) for query '{q}', continuing with remaining sources.")
+                return default
+            except Exception as e:
+                log_ist(f"[Job Searcher] Search source error for '{q}': {e}")
+                return default
+
+        excluded_clean = [p.strip().lower() for p in (exclude_portals or [])]
+
+        should_li = (not platform_filter_active or "linkedin" in target_plats) and not any(x in "linkedin" for x in excluded_clean)
+        should_reed = (not platform_filter_active or "reed" in target_plats) and not any(x in "reed" or x in "reed.co.uk" for x in excluded_clean)
+        should_js = (not platform_filter_active or "jobserve" in target_plats) and not any(x in "jobserve" for x in excluded_clean)
+        should_tj = (not platform_filter_active or "targetjobs" in target_plats) and not any(x in "targetjobs" or x in "targetjobs.co.uk" for x in excluded_clean)
+        should_ind = (not platform_filter_active or "indeed" in target_plats) and not any(x in "indeed" for x in excluded_clean)
+        should_ats = (not platform_filter_active or "direct ats" in target_plats) and not any(x in "ats" for x in excluded_clean)
+
+        li_task = _safe_run(search_linkedin_jobs, q, location, timeframe, timeout=25) if should_li else asyncio.sleep(0, result=[])
+        reed_task = _safe_run(search_reed_jobs, q, location, timeframe, timeout=12) if should_reed else asyncio.sleep(0, result=[])
+        jobserve_task = _safe_run(search_jobserve_jobs, q, location, timeframe, browser, timeout=15) if should_js else asyncio.sleep(0, result=[])
+        targetjobs_task = _safe_run(search_targetjobs_uk, q, location, timeframe, timeout=8) if should_tj else asyncio.sleep(0, result=[])
+        ind_task = _safe_run(search_indeed_jobs, q, location, timeframe, timeout=15) if should_ind else asyncio.sleep(0, result=[])
+        ats_task = _safe_run(search_direct_ats_jobs, q, location, timeframe, timeout=15) if should_ats else asyncio.sleep(0, result=[])
+
+        li_j, reed_j, js_j, tj_j, ind_j, ats_j = await asyncio.gather(li_task, reed_task, jobserve_task, targetjobs_task, ind_task, ats_task)
+        return q, li_j, reed_j, js_j, tj_j, ind_j, ats_j
+
+    query_tasks = [asyncio.create_task(_fetch_query_cluster(q)) for q in queries]
+    for completed_task in asyncio.as_completed(query_tasks):
+        q, li_jobs, reed_jobs, js_jobs, tj_jobs, ind_jobs, ats_jobs = await completed_task
+        raw_jobs.extend(li_jobs)
+        raw_jobs.extend(reed_jobs)
+        raw_jobs.extend(js_jobs)
+        raw_jobs.extend(tj_jobs)
+        raw_jobs.extend(ind_jobs)
+        raw_jobs.extend(ats_jobs)
+        indeed_jobs_for_est.extend(ind_jobs)
+        ats_cnt_str = f", {len(ats_jobs)} Direct ATS" if ats_jobs else ""
+        js_cnt_str = f", {len(js_jobs)} Jobserve" if js_jobs else ""
+        res_msg = f"Found {len(li_jobs)} LinkedIn, {len(ind_jobs)} Indeed, {len(reed_jobs)} Reed.co.uk{js_cnt_str}{ats_cnt_str} & {len(tj_jobs)} TargetJobs postings for '{q}'" if target_country == "GB" else f"Found {len(li_jobs)} LinkedIn, {len(ind_jobs)} Indeed{js_cnt_str}{ats_cnt_str} postings for '{q}'"
+        log_ist(res_msg)
+        yield json.dumps({"type": "log", "message": res_msg}) + " " * 2048 + "\n"
+
+    # If specific platform filter was active, retain only matches matching target platforms
+    if platform_filter_active:
+        raw_jobs = [
+            j for j in raw_jobs
+            if any(tp in (j.platform or '').lower() or tp in (j.url or '').lower() for tp in target_plats)
+        ]
+
+    # Deduplicate by job URL / ID and Canonical Title Key
+    import re
+    seen_ids = set()
+    seen_urls = set()
+    seen_canonical = set()
+    deduped_jobs = []
+    for job in raw_jobs:
+        # Canonical key: title + company (or title only for generic hiring agency)
+        clean_t = re.sub(r'[^a-zA-Z0-9]', '', (job.title or "").lower())
+        clean_c = re.sub(r'[^a-zA-Z0-9]', '', (job.company or "").lower())
+        if not clean_c or any(g in clean_c for g in ("hiringagency", "client", "confidential", "recruiter", "agency")):
+            canon_key = clean_t
+        else:
+            canon_key = f"{clean_t}_{clean_c}"
+
+        # For query-based URLs (like /viewjob?jk=... or JobSearch.aspx?kw=...), preserve the unique job key rather than stripping all queries
+        raw_u = job.url.strip().rstrip("/").lower()
+        if "jk=" in raw_u:
+            m_jk = re.search(r'jk=([a-f0-9]{16})', raw_u)
+            u_norm = f"indeed_{m_jk.group(1)}" if m_jk else raw_u
+        elif "currentjobid=" in raw_u:
+            m_cj = re.search(r'currentjobid=(\d+)', raw_u)
+            u_norm = f"linkedin_{m_cj.group(1)}" if m_cj else raw_u
+        elif "jobsearch.aspx" in raw_u or "jobserve" in (job.platform or "").lower():
+            u_norm = f"jobserve_{job.job_id}_{clean_t}"
+        else:
+            u_norm = raw_u.split("?")[0].rstrip("/").lower()
+
+        if job.job_id not in seen_ids and u_norm not in seen_urls and (not canon_key or canon_key not in seen_canonical):
+            seen_ids.add(job.job_id)
+            seen_urls.add(u_norm)
+            if canon_key:
+                seen_canonical.add(canon_key)
+            deduped_jobs.append(job)
+
+    yield json.dumps({"type": "log", "message": f"Found {len(deduped_jobs)} unique postings. Computing ATS matches..."}) + " " * 2048 + "\n"
+
+    # Separate instant API jobs (TargetJobs, Reed, Jobserve, Greenhouse, Ashby, Lever, Workday, Direct ATS) from web-scraped jobs (LinkedIn/Indeed)
+    fast_platforms = ("targetjobs", "reed", "jobserve", "greenhouse", "ashby", "lever", "workday", "direct ats")
+    
+    # Cap TargetJobs at maximum 7 to ensure LinkedIn and Direct ATS have high visibility
+    tj_count = 0
+    MAX_TARGETJOBS_CAP = 7
+    api_fast_jobs = []
+    for j in deduped_jobs:
+        plat = j.platform.lower()
+        if plat in fast_platforms:
+            if "targetjobs" in plat:
+                if tj_count >= MAX_TARGETJOBS_CAP:
+                    continue
+                tj_count += 1
+            api_fast_jobs.append(j)
+
+    scraped_jobs = [j for j in deduped_jobs if j.platform.lower() not in fast_platforms]
+    
+    scraped_jobs.sort(key=lambda j: _title_heuristic_score(j, resume_data), reverse=True)
+
+    scored_jobs = []
+
+    # Phase A: Instant in-memory scoring for direct ATS API jobs (TargetJobs, Greenhouse, Ashby, Lever, Workday, Reed)
+    if api_fast_jobs:
+        yield json.dumps({"type": "log", "message": f"Instantly computing ATS match scores for {len(api_fast_jobs)} direct ATS portal & TargetJobs openings..."}) + " " * 2048 + "\n"
+        for job in api_fast_jobs:
+            try:
+                if hasattr(job, "full_description") and job.full_description and len(job.full_description.strip()) > 20:
+                    r = await _score_job_with_real_jd(job, resume_data, None, asyncio.Semaphore(50))
+                    if r:
+                        scored_jobs.append(r)
+                        yield json.dumps({"type": "partial_result", "job": r}) + "\n"
+                else:
+                    r = _score_job_with_title_heuristic(job, resume_data)
+                    if r:
+                        scored_jobs.append(r)
+                        yield json.dumps({"type": "partial_result", "job": r}) + "\n"
+            except Exception as pe:
+                print(f"[find_matching_jobs] Direct portal scoring error for '{job.title}': {pe}")
+
+    # Separate LinkedIn and Indeed scraped jobs to enforce fair platform allocation
+    linkedin_scraped = [j for j in scraped_jobs if "linkedin" in j.platform.lower() or "linkedin" in j.url.lower()]
+    indeed_scraped = [j for j in scraped_jobs if "indeed" in j.platform.lower() or "indeed" in j.url.lower()]
+    other_scraped = [j for j in scraped_jobs if j not in linkedin_scraped and j not in indeed_scraped]
+
+    linkedin_scraped.sort(key=lambda j: _title_heuristic_score(j, resume_data), reverse=True)
+    indeed_scraped.sort(key=lambda j: _title_heuristic_score(j, resume_data), reverse=True)
+    other_scraped.sort(key=lambda j: _title_heuristic_score(j, resume_data), reverse=True)
+
+    # Take top up to 50 from LinkedIn and up to 50 from Indeed for accurate JD fetching
+    web_scored_batch = (
+        linkedin_scraped[:DISCOVERY_PLATFORM_FETCH_CAP] +
+        indeed_scraped[:DISCOVERY_PLATFORM_FETCH_CAP] +
+        other_scraped[:20]
+    )
+    # Remaining become title_only_batch
+    title_only_batch = (
+        linkedin_scraped[DISCOVERY_PLATFORM_FETCH_CAP:] +
+        indeed_scraped[DISCOVERY_PLATFORM_FETCH_CAP:] +
+        other_scraped[20:]
+    )
+
+    if web_scored_batch:
+        yield json.dumps({"type": "log", "message": f"Fetching real job descriptions for {len(web_scored_batch)} web listings ({min(len(linkedin_scraped), DISCOVERY_PLATFORM_FETCH_CAP)} LinkedIn, {min(len(indeed_scraped), DISCOVERY_PLATFORM_FETCH_CAP)} Indeed)..."}) + " " * 2048 + "\n"
+        semaphore = asyncio.Semaphore(DISCOVERY_FETCH_CONCURRENCY)
+        
+        async def _score_and_stream(job, log_queue_stream):
+            def _ui_logger(msg):
+                log_queue_stream.append(json.dumps({"type": "log", "message": msg}) + " " * 2048 + "\n")
+
+            async def _inner_score():
+                if browser is not None:
+                    try:
+                        return await _score_job_with_real_jd(job, resume_data, browser, semaphore, on_log=_ui_logger)
+                    except Exception:
+                        pass
+                # Fast HTTP fallback without spinning up heavy Playwright instances
+                return await _score_job_with_real_jd(job, resume_data, None, semaphore, on_log=_ui_logger)
+
+            try:
+                return await asyncio.wait_for(_inner_score(), timeout=25.0)
+            except asyncio.TimeoutError:
+                print(f"[Job Searcher] Scoring timed out after 25s for '{job.title}', preserving with title estimate")
+                return _score_job_with_title_heuristic(job, resume_data)
+            except Exception as e:
+                print(f"[Job Searcher] Error scoring job '{job.title}': {e}, preserving with title estimate")
+                return _score_job_with_title_heuristic(job, resume_data)
+
+        log_queue_stream = []
+        tasks = [asyncio.create_task(_score_and_stream(job, log_queue_stream)) for job in web_scored_batch]
+        for completed_task in asyncio.as_completed(tasks):
+            r = await completed_task
+            if log_queue_stream:
+                while log_queue_stream:
+                    yield log_queue_stream.pop(0)
+            else:
+                # Guaranteed heartbeat ping payload (forces proxy buffer flush)
+                yield "{\"type\":\"ping\"}" + " " * 2048 + "\n"
+            if r is not None:
+                log_msg = f"Scored match: {r['title']} @ {r['company']} ({r['score']}% Match)"
+                yield json.dumps({"type": "log", "message": log_msg}) + " " * 2048 + "\n"
+                scored_jobs.append(r)
+                yield json.dumps({"type": "partial_result", "job": r}) + "\n"
+            else:
+                # Yield a progress heartbeat chunk to keep connection active
+                yield json.dumps({"type": "log", "message": "⏳ Processing web listings..."}) + " " * 2048 + "\n"
+
+    if title_only_batch:
+        yield json.dumps({"type": "log", "message": f"Estimating {len(title_only_batch)} additional matches from title heuristic..."}) + " " * 2048 + "\n"
+        for job in title_only_batch:
+            r = _score_job_with_title_heuristic(job, resume_data)
+            scored_jobs.append(r)
+            yield json.dumps({"type": "partial_result", "job": r}) + "\n"
+
+    # Sort all scored jobs descending by ATS match score (highest score first)
+    scored_jobs.sort(key=lambda x: (x["estimated"], -x["score"]))
+    accurate_count = sum(1 for j in scored_jobs if not j["estimated"])
+    estimated_count = len(scored_jobs) - accurate_count
+    yield json.dumps({"type": "log", "message": f"Scanned {len(scored_jobs)} matches successfully! ({accurate_count} JD-scored, {estimated_count} title-estimated)"}) + "\n"
+
+    # Prepare EST section for any leftover Indeed jobs that weren't included in scored_jobs
+    def _normalize_track_url(u_str: str) -> str:
+        import re
+        raw = (u_str or "").strip().rstrip("/").lower()
+        if "jk=" in raw:
+            m = re.search(r'jk=([a-f0-9]{16})', raw)
+            return f"indeed_{m.group(1)}" if m else raw
+        return raw.split("?")[0].rstrip("/").lower()
+
+    scored_urls = {_normalize_track_url(j.get("url", "")) for j in scored_jobs if j.get("url")}
+    est_jobs = []
+    if indeed_jobs_for_est:
+        seen_indeed_ids = set()
+        for job in indeed_jobs_for_est:
+            u_norm = _normalize_track_url(job.url)
+            if job.job_id not in seen_indeed_ids and u_norm not in scored_urls:
+                seen_indeed_ids.add(job.job_id)
+                # Score with title heuristic so it's not arbitrary score 0
+                h_score = _title_heuristic_score(job, resume_data)
+                est_jobs.append({
+                    "title": job.title,
+                    "company": job.company,
+                    "location": job.location,
+                    "url": job.url,
+                    "source": "Indeed",
+                    "posted_date": job.post_date_raw,
+                    "score": h_score,
+                    "estimated": True,
+                    "reason": "Title-estimated from Indeed search listing"
+                })
+        yield json.dumps({"type": "log", "message": f"Found {len(est_jobs)} Indeed jobs in EST section (not scored by our engine)"}) + "\n"
+
+    # Save results to 5-minute TTL cache
+    cache_key = (keywords or "", location or "Remote", timeframe or "48h")
+    _job_search_cache.set(cache_key, scored_jobs)
+
+    yield json.dumps({"type": "result", "jobs": scored_jobs, "est_jobs": est_jobs}) + "\n"
+
