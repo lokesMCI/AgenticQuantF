@@ -24,6 +24,9 @@ job-finder-src/**/.env
 job-finder-src/**/candidate_profile.json
 job-finder-src/**/*.db
 job-finder-src/**/*.xlsx
+job-finder-src/data/
+job-finder-src/**/topic_terms.json
+job-finder-src/**/board_index.db
 
 # ─────────────────────────────────────────────────────────────────────────────
 # (original repository ignore rules, kept)

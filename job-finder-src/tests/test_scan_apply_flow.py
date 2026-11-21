@@ -339,7 +339,7 @@ def test_scan_finds_the_whole_field_and_drops_look_alikes(env, monkeypatch, tmp_
         return [{"title": t, "company": f"C{i}", "location": "London", "url": f"https://c.io/{i}", "platform": "Lever",
                  "ats_score": 70, "description": "d" * 150} for i, t in enumerate(titles)], 0
     monkeypatch.setattr(sc, "discover_jobs", fake_discover)
-    asyncio.run(sc.run_scan(request="cyber security internships", enrich=False))
+    asyncio.run(sc.run_scan(request="cyber security internships", enrich=False, expand=0))
     kept = sorted(r["Job Role"] for r in env.rows())
     assert kept == ["AI Security Research Intern", "Cyber Security Intern", "LLM Security Intern",
                     "Software Security Intern", "System Security Intern"]

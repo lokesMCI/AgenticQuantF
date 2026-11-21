@@ -89,19 +89,21 @@ def test_exact_skips_llm(monkeypatch):
     assert "quantum" in spec.topic_terms and "qml" not in spec.topic_terms
 
 
-def test_role_flag_is_explicit_and_unfiltered_unless_level_given():
-    assert rs.resolve_spec(role="Exact Query, Other Query") is None
-    spec = rs.resolve_spec(role="Exact Query", level="intern")
-    assert spec.queries == ["Exact Query"] and spec.matches("Anything Intern")[0] and not spec.matches("Anything")[0]
+def test_role_titles_are_expanded_like_topics_and_cover_all_levels_unless_one_is_given():
+    spec = rs.resolve_spec(role="Exact Query, Other Query", llm=lambda t: {})
+    assert spec.split and spec.topics == ["Exact Query", "Other Query"] and spec.level == "any"       # no level typed -> every level
+    assert spec.queries[:2] == ["Exact Query", "Other Query"]
+    one = rs.resolve_spec(role="Exact Query", level="intern", llm=lambda t: {})
+    assert not one.split and one.level == "intern" and one.matches("Exact Query Intern")[0] and not one.matches("Exact Query")[0]
 
 
-def test_profile_defaults_fill_what_was_not_typed():
+def test_profile_defaults_apply_only_when_nothing_was_typed():
     prefs = {"topics": ["applied AI"], "level": "intern"}
-    assert rs.resolve_spec(prefs=prefs, llm=fake_llm).queries == ["applied AI Intern", "applied AI Internship"]
-    spec = rs.resolve_spec(topic="quantum computing", prefs=prefs, llm=fake_llm)       # topic typed, level from profile
-    assert spec.level == "intern" and spec.topics == ["quantum computing"]
-    spec = rs.resolve_spec(request="robotics roles", level="any", prefs=prefs, llm=fake_llm)   # explicit any wins
-    assert spec.level == "any"
+    assert rs.resolve_spec(prefs=prefs, llm=fake_llm).queries == ["applied AI Intern", "applied AI Internship"]       # bare scan: profile
+    spec = rs.resolve_spec(topic="quantum computing", prefs=prefs, llm=fake_llm)                                      # typed, no level
+    assert spec.split and spec.topics == ["quantum computing"]                                                        # -> ALL levels, not the profile's intern
+    assert rs.resolve_spec(topic="quantum computing", level="graduate", prefs=prefs, llm=fake_llm).level == "graduate"
+    assert rs.resolve_spec(request="robotics roles", level="any", prefs=prefs, llm=fake_llm).level == "any"          # 'any' = one mixed list
     assert rs.resolve_spec(prefs={}) is None
 
 
@@ -284,3 +286,31 @@ def test_tester_testing_hacker_hacking_defence_defense_are_one_family():
                            llm=lambda t: {"include": [t.lower()], "exclude": [], "search": []})
     for title in ("Junior Penetration Tester", "Graduate Ethical Hacker", "Graduate Cyber Defense Analyst", "Graduate Penetration Testing Consultant"):
         assert spec.matches(title)[0], title
+
+
+def test_all_levels_queries_cover_plain_intern_and_graduate_wordings():
+    spec = rs.resolve_spec(topic="ai security engineer", llm=lambda t: {"include": ["ai security"], "exclude": [], "search": ["llm security", "ml security researcher"]})
+    q = spec.queries
+    assert q[0] == "ai security engineer" and "llm security" in q                     # plain titles first (they find experienced roles)
+    assert "ai security engineer Intern" in q and "ai security engineer Graduate" in q and "llm security Graduate" in q
+    assert 6 <= len(q) <= 28
+
+
+def test_experienced_level_excludes_intern_and_graduate_titles():
+    spec = rs.resolve_spec(topic="security", level="experienced", exact=True)
+    assert spec.matches("Security Engineer")[0] and spec.matches("Senior Security Engineer")[0]
+    assert not spec.matches("Security Intern")[0] and not spec.matches("Graduate Security Engineer")[0] and not spec.matches("Junior Security Analyst")[0]
+
+
+def test_legal_and_privacy_roles_are_not_security_jobs(monkeypatch):
+    fam = {"core": ["ai security"], "include": ["ai security", "privacy", "governance", "security", "privacy engineer"],
+           "exclude": [], "search": []}
+    monkeypatch.setattr(rs, "_llm_terms", lambda topic, llm=None: fam)
+    monkeypatch.setattr(rs, "_cache_path", lambda: os.devnull + ".none")
+    spec = rs.resolve_spec(topic="ai security", level="all", llm=lambda p: fam)
+    for title in ("Senior Privacy Counsel", "Data Privacy Lawyer", "Corporate Governance Paralegal", "Head of Privacy"):
+        assert not spec.matches(title)[0], title
+    assert spec.matches("Privacy Engineer")[0] and spec.matches("AI Security Engineer")[0]
+    # a search that is about legal work keeps legal titles
+    legal = rs.resolve_spec(topic="privacy counsel", level="all", exact=True)
+    assert legal.matches("Senior Privacy Counsel")[0]

@@ -34,9 +34,9 @@ def test_same_search_same_name_different_search_different_name():
     a = sr.auto_name(["cyber security"], "graduate")
     assert a == sr.auto_name(["Cyber Security"], "graduate")                  # case-insensitive: repeating a search reuses its Excel
     assert a != sr.auto_name(["cyber security"], "intern") and a != sr.auto_name(["applied AI"], "graduate")
-    assert a.startswith("cyber-security-") and a.endswith("_graduate")
+    assert a.startswith("cyber-security-") and a.endswith("-graduate") and sr.slug(a, 60) == a       # already a clean folder name
     long = sr.auto_name(["information security engineer", "cybersecurity engineer", "red teaming", "agentic ai security"], "graduate")
-    assert len(long) < 70 and long.endswith("_graduate")
+    assert len(long) < 70 and long.endswith("-graduate")
 
 
 def test_parse_inputs_matches_the_scan_precedence_without_calling_an_llm():
@@ -44,7 +44,8 @@ def test_parse_inputs_matches_the_scan_precedence_without_calling_an_llm():
     assert rs.parse_inputs(request="cyber security graduate roles", prefs=prefs) == (["cyber security"], "graduate")
     assert rs.parse_inputs(prefs=prefs) == (["applied AI"], "intern")
     assert rs.parse_inputs(topic="a, b", level="junior", prefs=prefs) == (["a", "b"], "junior")
-    assert rs.parse_inputs(role="Exact Role", prefs=prefs) == ([], None)
+    assert rs.parse_inputs(role="Exact Role, Other", prefs=prefs) == (["Exact Role", "Other"], "all")      # titles typed, no level -> all levels
+    assert rs.parse_inputs(topic="x", prefs=prefs) == (["x"], "all")
 
 
 # ─── create / reuse / choose ──────────────────────────────────────────────────
@@ -176,7 +177,8 @@ def test_scan_with_search_repeats_the_saved_criteria_not_the_profile_defaults(ws
     monkeypatch.setattr(scan_cmd, "_exists", lambda *a: False)
     ns = dict(request=[], retired_apply_flag=False, retired_apply_opt=None, search="cyber-grad", into=None, name=None, topic=None, level=None,
               role=None, location=None, timeframe=None, min_ats=None, limit=0, skip_portals=None, sponsor_only=False, top_applicant=False,
-              headless=True, no_enrich=False, no_ai_score=False, dry_run=False, no_boards=False, loose=False, exact=False, harvest=False)
+              headless=True, no_enrich=False, no_ai_score=False, dry_run=False, no_boards=False, loose=False, exact=False, harvest=False,
+              expand=1, no_expand=False, ai_limit=60, score_all=False, core_only=False)
     monkeypatch.setattr(scan_cmd, "logger", scan_cmd.logger)
     monkeypatch.setenv("JOB_FINDER_NO_HARVEST", "1")
     try:

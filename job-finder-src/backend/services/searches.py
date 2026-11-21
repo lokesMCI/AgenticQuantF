@@ -81,7 +81,7 @@ def auto_name(topics: Iterable[str], level: Optional[str], role: Optional[str] =
     basis = " ".join(topics) if topics else (role or "search")
     digest = hashlib.sha1((basis.lower() + "|" + (level or "any")).encode()).hexdigest()[:4]
     head = slug("-".join(slug(t, 24) for t in topics[:2]) if topics else role, 30)
-    return f"{head}-{digest}_{slug(level or 'any', 12)}"
+    return f"{head}-{digest}-{slug(level or 'any', 12)}"          # hyphens only: get_or_create() slugifies names, so they must already be clean
 
 
 def _paths(name: str) -> Search:
@@ -208,9 +208,12 @@ def handled_elsewhere(exclude_scanned: Optional[str] = None) -> Dict[str, str]:
     except ImportError:  # pragma: no cover
         from excel_tracker import ExcelTracker, _clean_status, normalize_job_url
     out: Dict[str, str] = {}
-    skip = os.path.abspath(exclude_scanned) if exclude_scanned else None
+    if isinstance(exclude_scanned, (list, tuple, set)):
+        skip = {os.path.abspath(x) for x in exclude_scanned}
+    else:
+        skip = {os.path.abspath(exclude_scanned)} if exclude_scanned else set()
     for s in list_searches():
-        if skip and os.path.abspath(s.scanned) == skip:
+        if os.path.abspath(s.scanned) in skip:
             continue
         for path in (s.scanned, s.approved):
             if not os.path.isfile(path):

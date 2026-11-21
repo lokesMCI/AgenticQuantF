@@ -35,7 +35,7 @@ COLUMNS: List[Tuple[str, int]] = [
     ("ID", 6), ("Company", 24), ("Job Role", 42), ("Location", 20), ("Platform", 14),
     ("Posted", 17), ("Closing Date", 14), ("Applied", 9), ("Status", 15), ("Approve", 9), ("ATS %", 8),
     ("Skills %", 9), ("Experience %", 12), ("Role Fit %", 10), ("Scored By", 11), ("Matched Skills", 32),
-    ("Missing Skills", 32), ("Fit Summary", 55), ("UK Sponsor", 11), ("Level", 11), ("Salary", 18),
+    ("Missing Skills", 32), ("Fit Summary", 55), ("UK Sponsor", 11), ("Level", 11), ("Role Level", 11), ("Years Exp", 10), ("Match", 9), ("Salary", 18),
     ("Date Found", 12), ("Date Applied", 12), ("Notes", 40), ("Docs OK", 9), ("Cover Letter", 12),
     ("Pack Folder", 42), ("Job URL", 55),
 ]
@@ -157,7 +157,7 @@ _PAYLOAD_MAP = {
     "uk_sponsor": "UK Sponsor", "seniority": "Level",
     "level": "Level", "salary": "Salary", "notes": "Notes", "job_url": "Job URL", "url": "Job URL",
     "applied": "Applied", "approve": "Approve", "docs_ok": "Docs OK", "cover_letter": "Cover Letter",
-    "pack_folder": "Pack Folder",
+    "pack_folder": "Pack Folder", "role_level": "Role Level", "years_exp": "Years Exp", "match": "Match",
 }
 
 

@@ -85,6 +85,27 @@ Useful options: `--limit 20`, `--min-ats 70`, `--loose` (also read descriptions)
 
 > **Why "130 found" can become 15 saved:** "found" counts everything every source returned. Job boards like Jobserve and Indeed ignore "Intern" and return permanent roles, which the level filter removes; jobs already in your tracker are skipped; off-topic titles are dropped. Real internships come mostly from LinkedIn. **Internships stay open for weeks, so use a month window (`--timeframe 1m`, or `timeframe` in your profile) for the first scans** (a one-week window found 1 new applied-AI internship, a month found about 20).
 
+#### One scan, three Excels: intern / graduate / experienced
+
+Type a topic or a few job titles **without a level** and *every* job found is filed into the Excel for its level, so nothing is lost:
+
+```bash
+./jf scan --role "ai security engineer, ai red team engineer, llm security engineer"
+./jf scan cyber security                       # same: no level typed -> all levels
+```
+
+| Excel | What goes in | Extra columns |
+|---|---|---|
+| **intern** | internships, placements, year-in-industry, summer analyst | |
+| **graduate** | graduate schemes, junior / entry-level / early-careers roles, apprenticeships, and roles asking for 0-1 years | **Years Exp** (when stated) |
+| **experienced** | everything else: mid, senior, lead ... | **Years Exp** (`3+`, `5-7`, `not stated`) and **Role Level** (Mid / Senior / Lead ...) |
+
+* The **title** decides first ("Graduate ...", "Senior ..."); only a neutral title like "Security Engineer" is judged from the **job description**: 0-1 years of experience means graduate, 2+ means experienced. Company-history lines ("founded 10 years ago") are ignored.
+* **Sampling and expansion:** the titles you type are expanded into ~25 realistic job-title variants and searched across every source (plain, `Intern` and `Graduate` wordings). Then a **second round** searches the exact-niche titles the first round found. `--expand 0` (or `--no-expand`) turns this off, `--expand 2` adds another round.
+* **Match column:** `Core` = the exact niche you asked for (e.g. "AI Security Engineer"); `Related` = an adjacent role (e.g. "Security Engineer", "AI Safety Researcher"). Expansion only learns from Core titles, so it cannot drift into generic roles. `--core-only` keeps just Core.
+* **AI scoring** is spent on intern and graduate roles first (`--ai-limit 60`, `--score-all` for everything); experienced roles get the free keyword score so your LLM quota lasts.
+* Type a level (`--level intern|graduate|experienced`, or "internships" / "graduate roles" in the sentence) to search just that one. `--level all` is the default when you typed a topic but no level; with nothing typed at all, your profile's topics and level are used.
+
 #### One Excel per search
 
 Every search has **its own folder, its own Excel files and its own application packs**, so a cyber-security search never mixes with your AI search:
@@ -238,7 +259,7 @@ AgenticQuantF/                      (your working folder; everything below marke
     └── jd_cache.db …                     cached job pages
 ```
 
-**`scanned_jobs.xlsx` / `approved_jobs.xlsx` columns:** ID · Company · Job Role · Location · Platform · Posted · **Closing Date** · **Applied** · **Status** · **Approve** · ATS % · Skills % · Experience % · Role Fit % · **Scored By** · Matched / Missing Skills · **Fit Summary** · UK Sponsor · Level · Salary · Date Found / Applied · **Notes** · **Docs OK** · **Cover Letter** · **Pack Folder** · Job URL.
+**`scanned_jobs.xlsx` / `approved_jobs.xlsx` columns:** ID · Company · Job Role · Location · Platform · Posted · **Closing Date** · **Applied** · **Status** · **Approve** · ATS % · Skills % · Experience % · Role Fit % · **Scored By** · Matched / Missing Skills · **Fit Summary** · UK Sponsor · Level · **Role Level** · **Years Exp** · **Match** (Core/Related) · Salary · Date Found / Applied · **Notes** · **Docs OK** · **Cover Letter** · **Pack Folder** · Job URL.
 Statuses: New → **Approved** → **Applied** (or Needs Review / Closed) · also Shortlisted, Interview, Offer, Rejected, Skipped, Withdrawn. Row colours: green = applied, blue = approved, orange = closes within 7 days, grey = closed. Save and close the file in Excel before running `approve`/`apply`.
 
 ---
