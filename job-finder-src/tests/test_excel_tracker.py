@@ -206,3 +206,12 @@ def test_remove_rows_keeps_hyperlinks_on_the_right_rows(tracker):
     col = h.index("Job URL") + 1
     assert [ws.cell(row=r, column=col).hyperlink.target for r in (2, 3)] == [rows[0]["Job URL"], rows[1]["Job URL"]]
     assert ws.max_row == 3 or all(ws.cell(row=r, column=1).value is None for r in range(4, ws.max_row + 1))
+
+
+def test_list_values_are_written_as_comma_separated_text(tmp_path):
+    t = ExcelTracker(str(tmp_path / "t.xlsx"))
+    added, _ = t.add_jobs([{"Company": "Acme", "Job Role": "Engineer", "Job URL": "https://x.test/1",
+                            "Matched Skills": ["Python", "Docker"], "Missing Skills": []}])
+    assert added
+    row = t.rows()[0]
+    assert row["Matched Skills"] == "Python, Docker"

@@ -341,6 +341,10 @@ class ExcelTracker:
             col = hdr.get(name)
             if col is None:
                 continue
+            if isinstance(val, (list, tuple, set)):                      # e.g. matched skills: one cell, comma-separated
+                val = ", ".join(str(x) for x in val if x not in (None, ""))
+            elif isinstance(val, dict):
+                val = "; ".join(f"{k}: {v}" for k, v in val.items())
             cell = ws.cell(row=r, column=col)
             if name == "Closing Date" or name in ("Date Found", "Date Applied"):
                 d = _to_date(val)
